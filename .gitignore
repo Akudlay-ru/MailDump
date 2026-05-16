@@ -1,0 +1,13 @@
+node_modules/
+dist/
+.DS_Store
+
+data.json
+data template.json
+presets.json
+_mail_dump_runs.json
+MailDump/
+
+*.zip
+*.7z
+*.rar
