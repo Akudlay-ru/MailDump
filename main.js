@@ -1,12 +1,12 @@
 /* ============================================================================
- * MailDump v0.0.1
+ * MailDump v0.0.6
  * First public compliance build.
  *
  * Desktop-only Obsidian plugin for exporting IMAP mail into analysis-ready
  * Markdown digests, optional mail notes and adjacent attachments.
  * ========================================================================== */
 
-const { Plugin, PluginSettingTab, Setting, ItemView, Notice } = require('obsidian');
+const { Plugin, PluginSettingTab, Setting, ItemView, Notice, setIcon } = require('obsidian');
 const tls = require('tls');
 const fs = require('fs');
 const path = require('path');
@@ -32,7 +32,18 @@ const DEFAULT_SETTINGS = {
   userAliases: '',
   keyContactEmail: '',
   unansweredThresholdHours: 7,
-  tlsRejectUnauthorized: false
+  tlsRejectUnauthorized: false,
+
+  // Режим 2: ссылка в браузер на Яндекс.Почту через поиск.
+  // Прямой web-message-id Яндекса из IMAP не получается стабильно.
+  webmailLinkMode: 'yandex_search', // off | yandex_search
+  webmailUrlTemplate: 'https://mail.yandex.ru/search?request={QUERY}',
+  webmailSearchQueryMode: 'subject_from_date', // subject | subject_from | subject_from_date | message_id
+  chatCommandPresetId: '',
+  dailyRunEnabled: false,
+  dailyRunTime: '09:00',
+  dailyRunPresetId: '',
+  dailyRunLastDate: ''
 };
 
 const PERIOD_OPTIONS = [
@@ -231,6 +242,83 @@ function normalizeSubject(subject) {
     .trim()
     .toLowerCase();
 }
+
+function cleanMessageId(value) {
+  return String(value || '')
+    .replace(/^<|>$/g, '')
+    .trim();
+}
+
+function compactForSearch(value, maxLen = 140) {
+  return String(value || '')
+    .replace(/\r?\n/g, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .trim()
+    .slice(0, maxLen);
+}
+
+function buildWebmailSearchQuery(record, settings) {
+  const mode = String(settings.webmailSearchQueryMode || 'subject_from_date');
+  const subject = compactForSearch(record.subject || record.normalizedSubject || '');
+  const fromEmail = extractEmails(record.from || '')[0] || '';
+  const date = String(record.date || '').slice(0, 10);
+  const messageId = cleanMessageId(record.messageId || '');
+
+  if (mode === 'message_id' && messageId) return messageId;
+  if (mode === 'subject') return subject;
+  if (mode === 'subject_from') return compactForSearch([subject, fromEmail].filter(Boolean).join(' '));
+  return compactForSearch([subject, fromEmail, date].filter(Boolean).join(' '));
+}
+
+function applyUrlTemplate(template, vars) {
+  let out = String(template || '');
+  for (const [key, value] of Object.entries(vars || {})) {
+    const encoded = encodeURIComponent(String(value || ''));
+    const raw = String(value || '');
+    out = out
+      .replaceAll(`{${key}}`, encoded)
+      .replaceAll(`{${key}_RAW}`, raw);
+  }
+  return out;
+}
+
+function buildWebmailLink(record, settings) {
+  if (String(settings.webmailLinkMode || 'off') === 'off') {
+    return { query: '', url: '' };
+  }
+
+  const query = buildWebmailSearchQuery(record, settings);
+  if (!query) return { query: '', url: '' };
+
+  const vars = {
+    QUERY: query,
+    SUBJECT: record.subject || '',
+    NORMALIZED_SUBJECT: record.normalizedSubject || '',
+    FROM: record.from || '',
+    FROM_EMAIL: extractEmails(record.from || '')[0] || '',
+    DATE: String(record.date || '').slice(0, 10),
+    MESSAGE_ID: cleanMessageId(record.messageId || ''),
+    UID: record.uid || '',
+    MAILBOX: record.mailbox || '',
+    THREAD_KEY: record.threadKey || ''
+  };
+
+  const template = settings.webmailUrlTemplate || 'https://mail.yandex.ru/search?request={QUERY}';
+  return { query, url: applyUrlTemplate(template, vars) };
+}
+
+function escapeMdLinkUrl(value) {
+  return String(value || '')
+    .replace(/\s/g, '%20')
+    .replace(/\)/g, '%29')
+    .replace(/\(/g, '%28');
+}
+
+function mdExternalLink(label, url) {
+  if (!url) return '—';
+  return `[${escapeMdInline(label)}](${escapeMdLinkUrl(url)})`;
+}
+
 function isSentMailbox(mailbox) {
   return /(^|[/\\])(sent|sent messages|отправленные|исходящие)([/\\]|$)/i.test(String(mailbox || ''));
 }
@@ -699,7 +787,7 @@ class PresetStore {
     const arr = raw || defaultPresets();
     const migrated = arr.map(migratePreset);
     if (!migrated.length) migrated.push(...defaultPresets());
-    this.save(migrated);
+    if (!raw || JSON.stringify(raw) !== JSON.stringify(migrated)) this.save(migrated);
     return migrated;
   }
   save(presets) {
@@ -1114,7 +1202,7 @@ function buildRecord({ mailbox, fetched, parsed, settings, preset }) {
     : stripHistoryAndSignatures(bodyRaw, { stripHistory: preset.content?.stripHistory !== false, stripSignatures: preset.content?.stripSignatures !== false, keepForwarded: preset.content?.keepForwarded !== false, replyChainStartMarker: preset.content?.replyChainStartMarker || '' });
   const cleaningLostBody = !preset.content?.keepOriginalBody && String(bodyRaw || '').trim().length > 0 && String(cleanBody || '').trim().length === 0;
   if (cleaningLostBody) cleanBody = bodyRaw;
-  return {
+  const record = {
     uid: fetched.uid,
     mailbox,
     flags: fetched.flags || '',
@@ -1141,6 +1229,12 @@ function buildRecord({ mailbox, fetched, parsed, settings, preset }) {
     bodyCleaningFallback: cleaningLostBody,
     bodyLength: cleanBody.length
   };
+
+  const webmail = buildWebmailLink(record, settings);
+  record.webmailSearchQuery = webmail.query;
+  record.webmailUrl = webmail.url;
+
+  return record;
 }
 function recordMatches(record, preset) {
   const inc = preset.filters?.include || {};
@@ -1262,6 +1356,8 @@ function buildDigestMarkdown({ preset, settings, range, records, stats, runEntry
   lines.push(`with_attachments: ${stats.withAttachments}`);
   lines.push(`threads: ${stats.threadCount}`);
   lines.push(`unanswered_threshold_hours: ${Number(settings.unansweredThresholdHours || 0)}`);
+  lines.push(`webmail_link_mode: "${String(settings.webmailLinkMode || 'off').replace(/"/g, '\\"')}"`);
+  lines.push(`webmail_search_query_mode: "${String(settings.webmailSearchQueryMode || 'subject_from_date').replace(/"/g, '\\"')}"`);
   lines.push(`unanswered_over_threshold_count: ${stats.unansweredCount}`);
   lines.push(`deduped_message_id_copies: ${Number(runEntry?.counts?.deduped || 0)}`);
   lines.push(`created_at: "${formatDateTime(now)}"`);
@@ -1275,7 +1371,8 @@ function buildDigestMarkdown({ preset, settings, range, records, stats, runEntry
   lines.push(`- Режим: .md-сводка в корне MailDump${shouldSaveMailNotes(preset) ? ' + .md писем' : ''}${shouldSaveAttachments(preset) ? ' + вложения рядом с письмами' : ''}`);
   lines.push(`- Тела писем: полностью, без ограничения символов`);
   lines.push(`- Цепочки/подписи вырезались: ${preset.content?.keepOriginalBody ? 'нет, оставлен исходный текст' : 'да'}`);
-  lines.push(`- Порог писем без ответа: ${Number(settings.unansweredThresholdHours || 7)} ч`, '');
+  lines.push(`- Порог писем без ответа: ${Number(settings.unansweredThresholdHours || 7)} ч`);
+  lines.push(`- Ссылки на веб-почту: ${String(settings.webmailLinkMode || 'off') === 'off' ? 'выключены' : 'Яндекс.Почта через поиск'}`, '');
   lines.push('## 2. Технические счётчики', '');
   lines.push('| Показатель | Значение |');
   lines.push('|---|---:|');
@@ -1307,16 +1404,27 @@ function buildDigestMarkdown({ preset, settings, range, records, stats, runEntry
   if (exc.subject) excLines.push(`- Тема: ${escapeMdInline(exc.subject)}`);
   lines.push(...(excLines.length ? excLines : ['- Нет']), '');
   lines.push('## 4. Индекс цепочек по теме', '');
-  lines.push('| threadKey по теме | Писем | Первое письмо | Последнее письмо | Нормализованная тема | Участники |');
-  lines.push('|---|---:|---|---|---|---|');
+  lines.push('| threadKey по теме | Писем | Первое письмо | Последнее письмо | Нормализованная тема | Участники | Последнее письмо |');
+  lines.push('|---|---:|---|---|---|---|---|');
   const threadRows = Array.from(stats.threads.entries()).map(([key, arr]) => {
     const ordered = arr.slice().sort((a, b) => a.dateObj - b.dateObj);
     const subject = ordered[0]?.normalizedSubject || ordered[0]?.subject || '';
     const participants = Array.from(new Set(ordered.flatMap(r => extractEmails(`${r.from}\n${r.to}\n${r.cc}`)))).slice(0, 8).join(', ');
-    return { key, count: arr.length, first: ordered[0]?.date || '', last: ordered[ordered.length - 1]?.date || '', subject, participants };
+    const lastRecord = ordered[ordered.length - 1];
+    return {
+      key,
+      count: arr.length,
+      first: ordered[0]?.date || '',
+      last: lastRecord?.date || '',
+      subject,
+      participants,
+      lastWebmailUrl: lastRecord?.webmailUrl || ''
+    };
   }).sort((a, b) => b.count - a.count || a.subject.localeCompare(b.subject, 'ru'));
-  for (const t of threadRows) lines.push(`| ${t.key} | ${t.count} | ${escapeMdInline(t.first)} | ${escapeMdInline(t.last)} | ${escapeMdInline(t.subject)} | ${escapeMdInline(t.participants)} |`);
-  if (!threadRows.length) lines.push('| — | 0 | — | — | — | — |');
+  for (const t of threadRows) {
+    lines.push(`| ${t.key} | ${t.count} | ${escapeMdInline(t.first)} | ${escapeMdInline(t.last)} | ${escapeMdInline(t.subject)} | ${escapeMdInline(t.participants)} | ${mdExternalLink('открыть', t.lastWebmailUrl)} |`);
+  }
+  if (!threadRows.length) lines.push('| — | 0 | — | — | — | — | — |');
   lines.push('');
   lines.push('## 5. Ключевые контакты по выгрузке', '');
   lines.push('| Контакт | Кол-во упоминаний в From/To/CC |');
@@ -1332,12 +1440,12 @@ function buildDigestMarkdown({ preset, settings, range, records, stats, runEntry
   } else if (!unanswered.length) {
     lines.push('Таких писем нет: либо на каждое входящее в выгрузке последнее письмо в цепочке исходящее, либо время ожидания меньше порога.', '');
   } else {
-    lines.push('| Дата входящего | От | Тема | threadKey | Часов прошло |');
-    lines.push('|---|---|---|---|---:|');
+    lines.push('| Дата входящего | От | Тема | threadKey | Часов прошло | Письмо |');
+    lines.push('|---|---|---|---|---:|---|');
     const nowMs = Date.now();
     for (const r of unanswered) {
       const ageH = r.dateObj ? Math.round((nowMs - r.dateObj.getTime()) / 36e5) : '—';
-      lines.push(`| ${escapeMdInline(r.date)} | ${escapeMdInline(r.from)} | ${escapeMdInline(r.subject)} | ${r.threadKey} | ${ageH} |`);
+      lines.push(`| ${escapeMdInline(r.date)} | ${escapeMdInline(r.from)} | ${escapeMdInline(r.subject)} | ${r.threadKey} | ${ageH} | ${mdExternalLink('открыть', r.webmailUrl)} |`);
     }
     lines.push('');
   }
@@ -1362,6 +1470,8 @@ function buildDigestMarkdown({ preset, settings, range, records, stats, runEntry
     lines.push(`subject: "${String(r.subject || '').replace(/"/g, '\\"')}"`);
     lines.push(`normalized_subject: "${String(r.normalizedSubject || '').replace(/"/g, '\\"')}"`);
     lines.push(`message_id: "${String(r.messageId || '').replace(/"/g, '\\"')}"`);
+    lines.push(`webmail_search_query: "${String(r.webmailSearchQuery || '').replace(/"/g, '\\"')}"`);
+    lines.push(`webmail_url: "${String(r.webmailUrl || '').replace(/"/g, '\\"')}"`);
     if (preset.content?.includeReferences !== false) {
       lines.push(`in_reply_to: "${String(r.inReplyTo || '').replace(/"/g, '\\"')}"`);
       lines.push(`references: "${String(r.references || '').replace(/"/g, '\\"')}"`);
@@ -1384,6 +1494,9 @@ function buildDigestMarkdown({ preset, settings, range, records, stats, runEntry
     lines.push(`body_length: ${r.bodyLength}`);
     lines.push('```');
     lines.push('');
+    if (r.webmailUrl) {
+      lines.push(`**Открыть в Яндекс.Почте:** ${mdExternalLink('открыть письмо', r.webmailUrl)}`, '');
+    }
     if (preset.content?.includeAttachments !== false && r.hasAttachments) {
       if (r.attachmentPaths && r.attachmentPaths.length) {
         lines.push('**Сохранённые вложения:**');
@@ -1450,6 +1563,8 @@ function writeMailRecordWithAttachments({ basePath, outputAbs, preset, record, r
   lines.push(`cc: "${String(record.cc || '').replace(/"/g, '\\"')}"`);
   lines.push(`subject: "${String(record.subject || '').replace(/"/g, '\\"')}"`);
   lines.push(`message_id: "${String(record.messageId || '').replace(/"/g, '\\"')}"`);
+  lines.push(`webmail_search_query: "${String(record.webmailSearchQuery || '').replace(/"/g, '\\"')}"`);
+  lines.push(`webmail_url: "${String(record.webmailUrl || '').replace(/"/g, '\\"')}"`);
   lines.push(`thread_key: "${record.threadKey}"`);
   lines.push(`reference_thread_key: "${record.referenceThreadKey || ''}"`);
   lines.push(`has_attachments: ${record.hasAttachments ? 'true' : 'false'}`);
@@ -1463,6 +1578,7 @@ function writeMailRecordWithAttachments({ basePath, outputAbs, preset, record, r
   lines.push(`- Кому: ${escapeMdInline(record.to)}`);
   if (record.cc) lines.push(`- Копия: ${escapeMdInline(record.cc)}`);
   lines.push(`- Message-ID: ${escapeMdInline(record.messageId)}`);
+  if (record.webmailUrl) lines.push(`- Яндекс.Почта: ${mdExternalLink('открыть письмо', record.webmailUrl)}`);
   lines.push(`- ThreadKey по теме: ${escapeMdInline(record.threadKey)}`);
   lines.push(`- ReferenceThreadKey: ${escapeMdInline(record.referenceThreadKey || '')}`, '');
   lines.push('## Тело письма', '', escapeMdBlock(record.body || ''), '');
@@ -1707,7 +1823,17 @@ function addField(parent, label, value, onChange, type = 'text') {
   wrap.createEl('label', { text: label });
   const input = wrap.createEl('input', { type });
   input.value = value == null ? '' : String(value);
-  input.oninput = () => onChange(input.value);
+  let last = input.value;
+  const commit = () => {
+    if (input.value === last) return;
+    last = input.value;
+    onChange(input.value);
+  };
+  input.onchange = commit;
+  input.onblur = commit;
+  input.onkeydown = evt => {
+    if (evt.key === 'Enter' && type !== 'textarea') input.blur();
+  };
   return input;
 }
 function addTextarea(parent, label, value, onChange) {
@@ -1715,7 +1841,14 @@ function addTextarea(parent, label, value, onChange) {
   wrap.createEl('label', { text: label });
   const input = wrap.createEl('textarea');
   input.value = value || '';
-  input.oninput = () => onChange(input.value);
+  let last = input.value;
+  const commit = () => {
+    if (input.value === last) return;
+    last = input.value;
+    onChange(input.value);
+  };
+  input.onchange = commit;
+  input.onblur = commit;
   return input;
 }
 function addSelect(parent, label, options, value, onChange) {
@@ -1736,6 +1869,34 @@ function addCheck(parent, label, checked, onChange) {
   row.createSpan({ text: label });
   cb.onchange = () => onChange(cb.checked);
   return cb;
+}
+
+function applyButtonIcon(button, icon, fallback) {
+  if (typeof setIcon === 'function') {
+    setIcon(button, icon);
+  } else {
+    button.setText(fallback || '');
+  }
+}
+
+function addIconButton(parent, icon, label, onClick, cls = '') {
+  const button = parent.createEl('button', { cls: `mail-dump-icon-button ${cls}`.trim() });
+  button.setAttr('type', 'button');
+  button.setAttr('aria-label', label);
+  button.setAttr('title', label);
+  applyButtonIcon(button, icon, label.slice(0, 1));
+  button.onclick = onClick;
+  return button;
+}
+
+function addCommandButton(parent, icon, label, onClick, cls = '') {
+  const button = parent.createEl('button', { cls: `mail-dump-command-button ${cls}`.trim() });
+  button.setAttr('type', 'button');
+  button.setAttr('title', label);
+  applyButtonIcon(button, icon, '');
+  button.createSpan({ text: label });
+  button.onclick = onClick;
+  return button;
 }
 
 class MailDumpView extends ItemView {
@@ -2048,6 +2209,385 @@ class MailDumpView extends ItemView {
   }
   async loadMailboxes() { try { await this.plugin.exportService.loadMailboxes(); new Notice('MailDump: список IMAP-папок загружен'); this.render(); } catch (e) { new Notice(`MailDump: ${e.message || e}`); this.render(); } }
   async preflight() { const p = this.currentPreset; if (!p) return; try { const r = await this.plugin.exportService.preflight(p); new Notice(`MailDump: найдено ${r.total}`); this.render(); } catch (e) { new Notice(`MailDump: ${e.message || e}`); this.render(); } }
+  get tabs() {
+    return [
+      ['preset', 'Пресет'],
+      ['mailboxes', 'Папки'],
+      ['filters', 'Фильтры'],
+      ['output', 'Вывод'],
+      ['journal', 'Журнал']
+    ];
+  }
+  compactBlock(parent, title, cls = '') {
+    const block = parent.createDiv({ cls: `mail-dump-block ${cls}`.trim() });
+    block.createDiv({ cls: 'mail-dump-block-title', text: title });
+    return block;
+  }
+  compactDetails(parent, title, open = false, cls = '') {
+    const details = parent.createEl('details', { cls: `mail-dump-details ${cls}`.trim() });
+    details.open = open;
+    details.createEl('summary', { text: title });
+    return details.createDiv({ cls: 'mail-dump-details-body' });
+  }
+  render() {
+    const root = this.containerEl.children[1] || this.containerEl;
+    root.empty();
+    root.addClass('mail-dump-panel');
+
+    const shell = root.createDiv({ cls: 'mail-dump-shell' });
+    this.progress = shell.createDiv({ cls: 'mail-dump-progress is-hidden' });
+    this.progressFill = this.progress.createDiv({ cls: 'mail-dump-progress-fill' });
+
+    this.renderHeader(shell);
+    this.renderCommandBar(shell);
+    this.renderPresetStrip(shell);
+    this.renderTabs(shell);
+
+    this.tabContentEl = shell.createDiv({ cls: 'mail-dump-tab-content' });
+    this.renderActiveTab(this.tabContentEl);
+    this.renderProcessFooter(shell);
+    this.renderStatus();
+  }
+  renderHeader(parent) {
+    const p = this.currentPreset;
+    const head = parent.createDiv({ cls: 'mail-dump-header' });
+    const title = head.createDiv({ cls: 'mail-dump-title' });
+    title.createDiv({ cls: 'mail-dump-title-main', text: 'MailDump' });
+    title.createDiv({ cls: 'mail-dump-title-sub', text: this.plugin.manifest?.version || '' });
+    this.statusChip = head.createDiv({ cls: 'mail-dump-status-chip' });
+    this.statusChip.setText('idle');
+
+    if (p) {
+      const r = resolveDateRange(p);
+      parent.createDiv({
+        cls: 'mail-dump-current-summary',
+        text: `${p.emoji || '📧'} ${p.name || 'Без названия'} · ${formatDateFolder(r.from)} → ${formatDateFolder(r.to)}`
+      });
+    }
+  }
+  renderCommandBar(parent) {
+    const bar = parent.createDiv({ cls: 'mail-dump-commandbar' });
+    this.btnRun = addCommandButton(bar, 'play', 'Пуск', () => this.runCurrent(), 'mod-cta');
+    this.btnBatch = addCommandButton(bar, 'list-checks', 'Выбранные', () => this.runBatch());
+    this.btnPreflight = addCommandButton(bar, 'calculator', 'Оценить', () => this.preflight());
+    this.btnStop = addCommandButton(bar, 'square', 'Стоп', () => this.plugin.ops.cancel());
+  }
+  renderProcessFooter(parent) {
+    const footer = parent.createDiv({ cls: 'mail-dump-process-footer' });
+    footer.createDiv({ cls: 'mail-dump-block-title', text: 'Текущий процесс' });
+    this.processCurrentEl = footer.createDiv({ cls: 'mail-dump-process-current' });
+    this.processMetaEl = footer.createDiv({ cls: 'mail-dump-process-meta mail-dump-note' });
+    this.processActionEl = footer.createDiv({ cls: 'mail-dump-process-actions' });
+  }
+  renderPresetStrip(parent) {
+    const block = this.compactBlock(parent, 'Пресеты', 'mail-dump-presets-block');
+    const list = block.createDiv({ cls: 'mail-dump-preset-list' });
+    for (const p of this.presets) {
+      const row = list.createDiv({ cls: `mail-dump-preset-row ${p.id === this.currentPresetId ? 'is-active' : ''}`.trim() });
+      const cb = row.createEl('input', { type: 'checkbox', cls: 'mail-dump-row-check' });
+      cb.checked = this.selectedBatch.has(p.id);
+      cb.onchange = () => cb.checked ? this.selectedBatch.add(p.id) : this.selectedBatch.delete(p.id);
+      const btn = row.createEl('button', { cls: 'mail-dump-preset-button' });
+      btn.setAttr('type', 'button');
+      btn.createSpan({ cls: 'mail-dump-preset-emoji', text: p.emoji || '📧' });
+      btn.createSpan({ cls: 'mail-dump-preset-name', text: p.name || 'Без названия' });
+      btn.onclick = () => {
+        this.currentPresetId = p.id;
+        this.savePresets();
+        this.render();
+      };
+    }
+
+    const actions = block.createDiv({ cls: 'mail-dump-icon-row' });
+    addIconButton(actions, 'plus', 'Новый пресет', () => {
+      const p = createPreset(null, '📧', 'Новый пресет', 'last_7_days', [], 'Выгрузки писем');
+      this.presets.push(p);
+      this.currentPresetId = p.id;
+      this.savePresets();
+      this.render();
+    });
+    addIconButton(actions, 'copy', 'Дублировать пресет', () => {
+      const p = this.currentPreset;
+      if (!p) return;
+      const copy = JSON.parse(JSON.stringify(p));
+      copy.id = `preset_${Date.now()}_${crypto.randomBytes(2).toString('hex')}`;
+      copy.name += ' копия';
+      this.presets.push(copy);
+      this.currentPresetId = copy.id;
+      this.savePresets();
+      this.render();
+    });
+    addIconButton(actions, 'pencil', 'Переименовать', () => this.renameCurrentPreset());
+    addIconButton(actions, 'save', 'Сохранить пресет', () => this.saveCurrentPresetWithNotice());
+    addIconButton(actions, 'download', 'Экспорт пресетов', () => {
+      try {
+        const rel = this.plugin.presetStore.exportToFile(this.presets);
+        new Notice(`MailDump: пресеты экспортированы в ${rel}`);
+        this.plugin.appendMessageHistory(`Пресеты экспортированы: ${rel}`);
+      } catch (e) { new Notice(`MailDump: ${e.message || e}`); }
+    });
+    addIconButton(actions, 'upload', 'Импорт пресетов', () => {
+      const filePath = prompt('Путь к JSON-файлу пресетов. Можно указать путь относительно vault или абсолютный путь.');
+      if (!filePath) return;
+      try {
+        this.presets = this.plugin.presetStore.importFromFile(filePath);
+        this.currentPresetId = this.presets[0]?.id || null;
+        this.selectedBatch.clear();
+        new Notice('MailDump: пресеты импортированы');
+        this.plugin.appendMessageHistory(`Пресеты импортированы: ${filePath}`);
+        this.render();
+      } catch (e) { new Notice(`MailDump: ${e.message || e}`); }
+    });
+    addIconButton(actions, 'trash-2', 'Удалить пресет', () => {
+      const p = this.currentPreset;
+      if (!p) return;
+      if (!confirm(`Удалить пресет «${p.name}»?`)) return;
+      this.presets = this.presets.filter(x => x.id !== p.id);
+      this.selectedBatch.delete(p.id);
+      this.currentPresetId = this.presets[0]?.id || null;
+      this.savePresets();
+      this.render();
+    }, 'is-danger');
+  }
+  renderTabs(parent) {
+    const tabbar = parent.createDiv({ cls: 'mail-dump-tabbar' });
+    if (!this.activeTab) this.activeTab = 'preset';
+    for (const [id, label] of this.tabs) {
+      const btn = tabbar.createEl('button', { cls: `mail-dump-tab ${this.activeTab === id ? 'is-active' : ''}`.trim(), text: label });
+      btn.setAttr('type', 'button');
+      btn.onclick = () => {
+        this.activeTab = id;
+        this.render();
+      };
+    }
+  }
+  renderActiveTab(parent) {
+    if (this.activeTab === 'mailboxes') return this.renderMailboxesTab(parent);
+    if (this.activeTab === 'filters') return this.renderFiltersTab(parent);
+    if (this.activeTab === 'output') return this.renderOutputTab(parent);
+    if (this.activeTab === 'journal') return this.renderJournalTab(parent);
+    return this.renderPresetTab(parent);
+  }
+  renderPresetTab(parent) {
+    const p = this.currentPreset;
+    if (!p) {
+      parent.createDiv({ cls: 'mail-dump-empty', text: 'Нет пресета' });
+      return;
+    }
+    const main = this.compactBlock(parent, 'Основное');
+    addField(main, 'Название', p.name, v => { p.name = v || 'Без названия'; this.savePresets(); });
+    addField(main, 'Эмодзи', p.emoji, v => { p.emoji = v || '📧'; this.savePresets(); });
+    addSelect(main, 'Период', PERIOD_OPTIONS, p.period.mode, v => { p.period.mode = v; this.savePresets(); this.render(); });
+    if (p.period.mode === 'custom') {
+      addField(main, 'Дата с', p.period.from || formatDateFolder(resolveDateRange(p).from), v => { p.period.from = v; this.savePresets(); }, 'date');
+      addField(main, 'Дата по', p.period.to || formatDateFolder(resolveDateRange(p).to), v => { p.period.to = v; this.savePresets(); }, 'date');
+    } else {
+      const r = resolveDateRange(p);
+      main.createDiv({ cls: 'mail-dump-note', text: `${formatDateFolder(r.from)} → ${formatDateFolder(r.to)}` });
+    }
+    addSelect(main, 'Сортировка', SORT_OPTIONS, p.sort.by, v => { p.sort.by = v; this.savePresets(); });
+    addSelect(main, 'Порядок', [['asc', 'По возрастанию'], ['desc', 'По убыванию']], p.sort.direction, v => { p.sort.direction = v; this.savePresets(); });
+
+    const content = this.compactBlock(parent, 'Содержимое');
+    const checks = content.createDiv({ cls: 'mail-dump-check-grid' });
+    addCheck(checks, 'Кому', p.content.includeTo !== false, v => { p.content.includeTo = v; this.savePresets(); });
+    addCheck(checks, 'Копия', p.content.includeCc !== false, v => { p.content.includeCc = v; this.savePresets(); });
+    addCheck(checks, 'References', p.content.includeReferences !== false, v => { p.content.includeReferences = v; this.savePresets(); });
+    addCheck(checks, 'Attachments', p.content.includeAttachments !== false, v => { p.content.includeAttachments = v; this.savePresets(); });
+    addSelect(content, 'Очистка текста', [['clean', 'Очищать ответы и подписи'], ['raw', 'Оставить исходный текст']], p.content.keepOriginalBody ? 'raw' : 'clean', v => {
+      p.content.keepOriginalBody = v === 'raw';
+      if (p.content.keepOriginalBody) {
+        p.content.stripHistory = false;
+        p.content.stripSignatures = false;
+      } else {
+        p.content.stripHistory = true;
+        p.content.stripSignatures = true;
+      }
+      this.savePresets();
+      this.render();
+    });
+    if (!p.content.keepOriginalBody) {
+      addCheck(content, 'Удалять цепочки переписки', p.content.stripHistory !== false, v => { p.content.stripHistory = v; this.savePresets(); this.render(); });
+      if (p.content.stripHistory !== false) {
+        addCheck(content, 'Оставить пересылаемые письма', p.content.keepForwarded !== false, v => { p.content.keepForwarded = v; this.savePresets(); });
+        addTextarea(content, 'Маркер начала цепочки', p.content.replyChainStartMarker || '', v => { p.content.replyChainStartMarker = v || ''; this.savePresets(); });
+      }
+      addCheck(content, 'Удалять подписи', p.content.stripSignatures !== false, v => { p.content.stripSignatures = v; this.savePresets(); });
+    }
+
+    const advanced = this.compactDetails(parent, 'Расширенные настройки');
+    const current = String(p.performance?.fetchBatchSize || this.plugin.settings.fetchBatchSize || 10);
+    addSelect(advanced, 'Размер пакета UID', [['1', '1'], ['5', '5'], ['10', '10'], ['15', '15'], ['25', '25'], ['50', '50']], current, v => {
+      p.performance = p.performance || {};
+      p.performance.fetchBatchSize = Number(v || 10);
+      this.savePresets();
+    });
+  }
+  renderMailboxesTab(parent) {
+    const p = this.currentPreset;
+    if (!p) return;
+    if (!this.pendingMailboxSelections.has(p.id)) this.pendingMailboxSelections.set(p.id, new Set(p.source.mailboxes || []));
+    const pendingSet = this.pendingMailboxSelections.get(p.id);
+    const block = this.compactBlock(parent, 'IMAP-папки');
+    const actions = block.createDiv({ cls: 'mail-dump-actions' });
+    addCommandButton(actions, 'refresh-cw', 'Обновить / применить', () => this.refreshAndApplyMailboxes());
+    const available = this.plugin.availableMailboxes || [];
+    if (available.length) {
+      const mb = block.createDiv({ cls: 'mail-dump-mailboxes' });
+      for (const name of available) addCheck(mb, name, pendingSet.has(name), v => {
+        v ? pendingSet.add(name) : pendingSet.delete(name);
+        this.renderStatus();
+      });
+    } else {
+      block.createDiv({ cls: 'mail-dump-note', text: 'Папки пока не загружены. Можно указать имена вручную.' });
+    }
+    addTextarea(block, 'Вручную через запятую', Array.from(pendingSet).join(', '), v => {
+      this.pendingMailboxSelections.set(p.id, new Set(splitTerms(v)));
+    });
+  }
+  renderFiltersTab(parent) {
+    const p = this.currentPreset;
+    if (!p) return;
+    const include = this.compactBlock(parent, 'Включить');
+    addField(include, 'От содержит', p.filters.include.from, v => { p.filters.include.from = v; this.savePresets(); });
+    addField(include, 'Кому/копия содержит', p.filters.include.to, v => { p.filters.include.to = v; this.savePresets(); });
+    addField(include, 'Тема содержит', p.filters.include.subject, v => { p.filters.include.subject = v; this.savePresets(); });
+
+    const exclude = this.compactBlock(parent, 'Исключить');
+    addField(exclude, 'От содержит', p.filters.exclude.from, v => { p.filters.exclude.from = v; this.savePresets(); });
+    addField(exclude, 'Кому/копия содержит', p.filters.exclude.to, v => { p.filters.exclude.to = v; this.savePresets(); });
+    addField(exclude, 'Тема содержит', p.filters.exclude.subject, v => { p.filters.exclude.subject = v; this.savePresets(); });
+  }
+  renderOutputTab(parent) {
+    const p = this.currentPreset;
+    if (!p) return;
+    const summary = this.compactBlock(parent, 'Сводка');
+    addField(summary, 'Название файла', p.output.exportName, v => { p.output.exportName = v || p.name; this.savePresets(); });
+    summary.createDiv({ cls: 'mail-dump-note', text: `Папка: ${this.plugin.settings.outputFolder || 'MailDump'}` });
+
+    const files = this.compactBlock(parent, 'Файлы писем и вложения');
+    addCheck(files, 'Создавать .md файлы писем', !!p.artifacts?.saveMailNotes, v => {
+      p.artifacts = p.artifacts || {};
+      p.artifacts.saveMailNotes = v;
+      this.savePresets();
+      this.render();
+    });
+    addCheck(files, 'Сохранять вложения рядом с письмом', !!p.artifacts?.saveAttachments, v => {
+      p.artifacts = p.artifacts || {};
+      p.artifacts.saveAttachments = v;
+      if (v) p.artifacts.saveMailNotes = true;
+      this.savePresets();
+      this.render();
+    });
+    if (p.artifacts?.saveAttachments) {
+      const extBox = files.createDiv({ cls: 'mail-dump-check-grid' });
+      const extSet = new Set(getEnabledAttachmentExts(p));
+      for (const ext of ['txt', 'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx']) {
+        addCheck(extBox, ext, extSet.has(ext), v => {
+          const list = Array.isArray(p.artifacts.attachmentExtensions) ? p.artifacts.attachmentExtensions.map(normalizeExt).filter(Boolean) : [];
+          const set = new Set(list);
+          v ? set.add(ext) : set.delete(ext);
+          p.artifacts.attachmentExtensions = Array.from(set);
+          this.savePresets();
+        });
+      }
+      addField(files, 'Другие расширения', p.artifacts.customAttachmentExtensions || '', v => { p.artifacts.customAttachmentExtensions = v; this.savePresets(); });
+      addSelect(files, 'Группировка', [['none', 'Без подпапок'], ['day', 'По дням'], ['week', 'По неделям'], ['month', 'По месяцам']], p.output.grouping || 'day', v => { p.output.grouping = v; this.savePresets(); });
+      addField(files, 'Подпапка', p.output.subfolder || '', v => { p.output.subfolder = v || ''; this.savePresets(); });
+    }
+  }
+  renderJournalTab(parent) {
+    const status = this.compactBlock(parent, 'Статус');
+    this.journalCurrentEl = status.createDiv({ cls: 'mail-dump-status-current' });
+    this.historyBox = status.createDiv({ cls: 'mail-dump-status-history' });
+    const actions = status.createDiv({ cls: 'mail-dump-actions' });
+    addCommandButton(actions, 'file-json', 'Открыть JSON', () => {
+      const rel = path.join(this.plugin.settings.outputFolder || 'MailDump', RUN_LOG_FILE).replace(/\\/g, '/');
+      this.app.workspace.openLinkText(rel, '', false);
+    });
+    addCommandButton(actions, 'eraser', 'Очистить журнал', () => {
+      if (!confirm('Очистить _mail_dump_runs.json? Файлы выгрузок не удаляются.')) return;
+      new RunLogStore(this.plugin).clear();
+      this.plugin.appendMessageHistory('Журнал запусков очищен');
+      this.renderStatus();
+    });
+
+    const danger = this.compactBlock(parent, 'Опасная зона', 'mail-dump-danger-zone');
+    const last = new RunLogStore(this.plugin).getLastDigestRun();
+    danger.createDiv({ cls: 'mail-dump-note', text: last ? `Последняя сводка: ${last.finishedAt} · ${last.presetName} · файлов: ${(last.filesCreated || []).length}` : 'Журнал пуст' });
+    const dangerActions = danger.createDiv({ cls: 'mail-dump-actions' });
+    addCommandButton(dangerActions, 'trash-2', 'Удалить последнюю', () => {
+      if (!confirm('Удалить последний digest-файл по журналу? Почта на сервере не затрагивается.')) return;
+      try { const res = new CleanupService(this.plugin).deleteLastDigest(); new Notice(`Удалено файлов: ${res.deleted}`); this.render(); }
+      catch (e) { new Notice(`MailDump: ${e.message || e}`); }
+    }, 'is-danger');
+    addCommandButton(dangerActions, 'folder-x', 'Очистить выгрузки', () => {
+      if (!confirm('Удалить все файлы выгрузок в MailDump, но оставить служебный JSON журнала?')) return;
+      try { const res = new CleanupService(this.plugin).deleteOutputContents({ includeServiceJson: false }); new Notice(`Удалено файлов: ${res.deletedFiles}`); this.render(); }
+      catch (e) { new Notice(`MailDump: ${e.message || e}`); }
+    }, 'is-danger');
+    addCommandButton(dangerActions, 'ban', 'Полная очистка', () => {
+      if (!confirm('Полностью очистить папку MailDump, включая служебные JSON? Это удалит журнал запусков.')) return;
+      try { const res = new CleanupService(this.plugin).deleteOutputContents({ includeServiceJson: true }); new Notice(`MailDump очищен. Удалено файлов: ${res.deletedFiles}`); this.render(); }
+      catch (e) { new Notice(`MailDump: ${e.message || e}`); }
+    }, 'is-danger');
+  }
+  setBusyButtons(busy) {
+    for (const b of [this.btnRun, this.btnBatch, this.btnPreflight]) if (b) b.disabled = busy;
+    if (this.btnStop) this.btnStop.disabled = !busy;
+  }
+  renderStatus() {
+    const op = this.plugin.ops.active;
+    const busy = !!op;
+    this.setBusyButtons(busy);
+    if (this.progress && this.progressFill) {
+      if (!busy || op.progressMode === 'hidden') this.progress.addClass('is-hidden');
+      else this.progress.removeClass('is-hidden');
+      this.progressFill.style.width = op && op.progressMode === 'percent' ? `${Math.max(0, Math.min(100, Number(op.progress || 0)))}%` : '35%';
+      this.progress.toggleClass('is-indeterminate', !!op && op.progressMode !== 'percent');
+    }
+    if (this.statusChip) {
+      this.statusChip.setText(op ? (op.status === 'cancelling' ? 'stopping' : op.type || 'busy') : 'idle');
+      this.statusChip.toggleClass('is-busy', busy);
+    }
+    if (this.processCurrentEl) {
+      this.processCurrentEl.empty();
+      this.processMetaEl.empty();
+      this.processActionEl.empty();
+      this.processCurrentEl.setText(op ? (op.text || op.type) : 'Нет активной операции');
+      if (op && op.progressMode === 'percent') {
+        this.processMetaEl.setText(`${Math.max(0, Math.min(100, Number(op.progress || 0)))}%`);
+      } else if (op && op.counts) {
+        this.processMetaEl.setText(Object.entries(op.counts).map(([k, v]) => `${k}: ${v}`).join(' · '));
+      } else {
+        this.processMetaEl.setText(op ? 'Выполняется...' : 'Ожидание запуска');
+      }
+      if (op && op.resultPath) {
+        const open = this.processActionEl.createEl('button', { text: 'Открыть сводку', cls: 'mail-dump-link-button' });
+        open.onclick = () => this.app.workspace.openLinkText(op.resultPath, '', false);
+      }
+    }
+    if (this.journalCurrentEl) {
+      this.journalCurrentEl.empty();
+      this.journalCurrentEl.createDiv({ text: op ? (op.text || op.type) : 'Нет активной операции' });
+      if (op && op.counts) this.journalCurrentEl.createDiv({ cls: 'mail-dump-note', text: Object.entries(op.counts).map(([k, v]) => `${k}: ${v}`).join(' · ') });
+      if (op && op.resultPath) {
+        const open = this.journalCurrentEl.createEl('button', { text: 'Открыть сводку', cls: 'mail-dump-link-button' });
+        open.onclick = () => this.app.workspace.openLinkText(op.resultPath, '', false);
+      }
+    }
+    if (this.historyBox) {
+      this.historyBox.empty();
+      const history = this.plugin.messageHistory || [];
+      if (!history.length) {
+        this.historyBox.createDiv({ cls: 'mail-dump-note', text: 'История пуста' });
+      } else {
+        for (const item of history.slice(-Number(this.plugin.settings.messageHistoryLimit || 80)).reverse()) {
+          this.historyBox.createDiv({ cls: 'mail-dump-status-line', text: `${item.time} · ${item.text}` });
+        }
+      }
+    }
+  }
 }
 
 class MailDumpSettingsTab extends PluginSettingTab {
@@ -2075,9 +2615,62 @@ class MailDumpSettingsTab extends PluginSettingTab {
     new Setting(containerEl).setName('Дополнительные адреса пользователя').setDesc('Через запятую. Нужны для incoming/outgoing и To/CC.').addText(t => t.setValue(this.plugin.settings.userAliases).onChange(async v => { this.plugin.settings.userAliases = v; await this.plugin.saveSettings(); }));
     new Setting(containerEl).setName('Контрольный адрес для счётчика').setDesc('Опционально. Используется только для счётчика в сводке.').addText(t => t.setValue(this.plugin.settings.keyContactEmail).onChange(async v => { this.plugin.settings.keyContactEmail = v; await this.plugin.saveSettings(); }));
     new Setting(containerEl).setName('Порог писем без ответа, часов').addText(t => t.setValue(String(this.plugin.settings.unansweredThresholdHours || 7)).onChange(async v => { this.plugin.settings.unansweredThresholdHours = Number(v || 7); await this.plugin.saveSettings(); }));
+
+    new Setting(containerEl)
+      .setName('Ссылки на веб-почту')
+      .setDesc('Режим 2: добавляет в выгрузку ссылки, которые открывают Яндекс.Почту в браузере через поиск по письму.')
+      .addDropdown(d => d
+        .addOption('off', 'Выключено')
+        .addOption('yandex_search', 'Яндекс.Почта: поиск по письму')
+        .setValue(this.plugin.settings.webmailLinkMode || 'yandex_search')
+        .onChange(async v => {
+          this.plugin.settings.webmailLinkMode = v;
+          await this.plugin.saveSettings();
+          this.display();
+        }));
+
+    if ((this.plugin.settings.webmailLinkMode || 'off') !== 'off') {
+      new Setting(containerEl)
+        .setName('Шаблон URL веб-почты')
+        .setDesc('Переменные: {QUERY}, {SUBJECT}, {FROM_EMAIL}, {DATE}, {MESSAGE_ID}, {UID}, {MAILBOX}, {THREAD_KEY}. Если URL поиска Яндекса изменится, правится только этот шаблон.')
+        .addText(t => t
+          .setValue(this.plugin.settings.webmailUrlTemplate || 'https://mail.yandex.ru/search?request={QUERY}')
+          .onChange(async v => {
+            this.plugin.settings.webmailUrlTemplate = v || 'https://mail.yandex.ru/search?request={QUERY}';
+            await this.plugin.saveSettings();
+          }));
+
+      new Setting(containerEl)
+        .setName('Запрос для поиска письма')
+        .setDesc('Самый устойчивый вариант: тема + отправитель + дата. Message-ID оставлен как экспериментальный режим.')
+        .addDropdown(d => d
+          .addOption('subject', 'Тема')
+          .addOption('subject_from', 'Тема + отправитель')
+          .addOption('subject_from_date', 'Тема + отправитель + дата')
+          .addOption('message_id', 'Message-ID')
+          .setValue(this.plugin.settings.webmailSearchQueryMode || 'subject_from_date')
+          .onChange(async v => {
+            this.plugin.settings.webmailSearchQueryMode = v;
+            await this.plugin.saveSettings();
+          }));
+    }
+
     new Setting(containerEl).setName('Корневая папка выгрузки').addText(t => t.setValue(this.plugin.settings.outputFolder).onChange(async v => { this.plugin.settings.outputFolder = v || 'MailDump'; await this.plugin.saveSettings(); }));
     new Setting(containerEl).setName('Таймаут IMAP-команды, мс').setDesc('Если письмо тяжёлое или сервер отвечает медленно, увеличьте до 120000–180000. По умолчанию загружаются HEADER + текстовые MIME-части; выбранные вложения скачиваются только по разрешённым расширениям.').addText(t => t.setValue(String(this.plugin.settings.commandTimeoutMs || 60000)).onChange(async v => { this.plugin.settings.commandTimeoutMs = Number(v || 60000); await this.plugin.saveSettings(); }));
     new Setting(containerEl).setName('Таймаут подключения, мс').addText(t => t.setValue(String(this.plugin.settings.connectTimeoutMs || 60000)).onChange(async v => { this.plugin.settings.connectTimeoutMs = Number(v || 60000); await this.plugin.saveSettings(); }));
+    const presetsForCommand = this.plugin.presetStore.load();
+    new Setting(containerEl)
+      .setName('Command preset')
+      .setDesc('Preset used by command "Run MailDump command preset".')
+      .addDropdown(d => {
+        if (!presetsForCommand.length) d.addOption('', 'No preset');
+        for (const p of presetsForCommand) d.addOption(p.id, `${p.emoji || '[preset]'} ${p.name || p.id}`);
+        d.setValue(this.plugin.settings.chatCommandPresetId || presetsForCommand[0]?.id || '');
+        d.onChange(async v => {
+          this.plugin.settings.chatCommandPresetId = v || '';
+          await this.plugin.saveSettings();
+        });
+      });
     new Setting(containerEl).setName('Проверять TLS-сертификат').setDesc('Для корпоративных/нестандартных окружений можно выключить.').addToggle(t => t.setValue(!!this.plugin.settings.tlsRejectUnauthorized).onChange(async v => { this.plugin.settings.tlsRejectUnauthorized = !!v; await this.plugin.saveSettings(); }));
   }
 }
@@ -2095,11 +2688,31 @@ module.exports = class MailDumpM1Plugin extends Plugin {
     this.renderStatusBar(null);
     this.presetStore = new PresetStore(this);
     this.exportService = new ExportService(this);
+    const chatPresetList = this.presetStore.load();
+    if (!this.settings.chatCommandPresetId || !chatPresetList.some(p => p.id === this.settings.chatCommandPresetId)) {
+      this.settings.chatCommandPresetId = chatPresetList[0]?.id || '';
+      await this.saveSettings();
+    }
     this.registerView(VIEW_TYPE, leaf => new MailDumpView(leaf, this));
     this.addSettingTab(new MailDumpSettingsTab(this.app, this));
     this.addCommand({ id: 'open-maildump-panel', name: 'Open MailDump panel', callback: () => this.openPanel() });
     this.addCommand({ id: 'stop-maildump-operation', name: 'Stop current MailDump operation', callback: () => this.ops.cancel() });
+    this.addCommand({ id: 'run-maildump-command', name: 'Run MailDump command preset', callback: () => this.runCurrentPresetFromCommand() });
     this.addRibbonIcon('mail', 'MailDump', () => this.openPanel());
+  }
+  getChatCommandPreset() {
+    const presetId = this.settings.chatCommandPresetId;
+    const presets = this.presetStore.load();
+    if (!presets.length) return null;
+    return presets.find(p => p.id === presetId) || presets[0];
+  }
+  async runCurrentPresetFromCommand() {
+    const p = this.getChatCommandPreset();
+    if (!p) return;
+    if (!p.source.mailboxes.length) { new Notice('MailDump: no mailbox in command preset'); return; }
+    if (this.ops.isBusy()) { new Notice('MailDump: operation already running'); return; }
+    try { await this.exportService.runPreset(p); new Notice(`MailDump: digest created: ${p.name}`); }
+    catch (e) { new Notice(`MailDump: ${e.message || e}`); }
   }
   onunload() { this.ops.cancel(); this.app.workspace.detachLeavesOfType(VIEW_TYPE); }
   appendMessageHistory(text, op) {

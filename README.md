@@ -1,5 +1,7 @@
 # MailDump
 
+Current release: `0.0.6`.
+
 > IMAP mail → clean Markdown digest → structured analysis inside Obsidian.
 
 MailDump is a desktop-only Obsidian plugin for exporting email from IMAP folders into analysis-ready Markdown.
@@ -7,6 +9,16 @@ MailDump is a desktop-only Obsidian plugin for exporting email from IMAP folders
 It is built for people who do not need another pretty mailbox. They need a controlled source package: messages, metadata, threads, contacts, unanswered items, attachments when necessary, and a format that can be read by humans, Obsidian, Dataview, scripts, or an LLM.
 
 No CSV graveyard. No fake AI magic. No black-box sync. Just mail pulled into a vault in a form that can be inspected, reused, archived and analyzed.
+
+---
+
+## Release 0.0.6
+
+- Rebuilt the panel as a compact Obsidian-style side pane.
+- Added a resizable preset list with a native resize handle.
+- Restored a persistent current-process block at the bottom of the panel.
+- Kept the Obsidian status bar integration.
+- Fixed active preset outline clipping inside the scrollable preset list.
 
 ---
 
