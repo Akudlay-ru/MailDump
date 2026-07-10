@@ -36,21 +36,39 @@ No CSV graveyard. No fake AI magic. No black-box sync. Just mail pulled into a v
 
 ---
 
+## Для чего это нужно
+
+MailDump нужен, когда почта становится не перепиской, а источником управленческих фактов.
+
+Типовые сценарии:
+
+- собрать почту за день, неделю или произвольный период;
+- выгрузить файлы от сервисов транскрибации;
+- разобрать проектную переписку по темам;
+- выгрузить сразу все пришедшие `*.pdf` за период;
+- найти входящие, которые могли остаться без ответа;
+- сохранить доказуемые метаданные письма;
+- выгрузить постмиты отдельными Markdown-файлами;
+- положить вложения рядом с конкретным письмом.
+
+Главная идея простая: письмо должно стать нормальным проектным источником, а не утонуть в ящике между рекламой, пересылками и корпоративным фольклором.
+
 ## What MailDump is for
 
-MailDump turns selected IMAP folders into a Markdown digest for operational analysis.
+MailDump is useful when email stops being just correspondence and becomes a source of management facts.
 
 Typical use cases:
 
-- collect project correspondence for a day, week or custom period;
-- prepare raw material for management summaries;
-- identify subject-based email threads;
+- collect email for a day, week, or custom period;
+- export files from transcription services;
+- break project correspondence down by topic;
+- export all received `*.pdf` files for a period;
 - find incoming messages that may still need a reply;
-- preserve message metadata for later verification;
-- export post-meeting or post-action emails as separate Markdown notes;
-- save selected attachment types next to the corresponding mail note.
+- preserve verifiable message metadata;
+- export post-action emails as separate Markdown files;
+- place attachments next to the exact message they belong to.
 
-MailDump is not an email client. It does not replace your mailbox. It extracts the part of the mailbox that matters for analysis and puts it where the work actually happens: in Markdown.
+The core idea is simple: an email should become a normal project source instead of sinking in the mailbox between ads, forwards, and corporate folklore.
 
 ---
 
