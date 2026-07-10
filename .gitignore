@@ -3,6 +3,7 @@ dist/
 .DS_Store
 
 data.json
+maildump-settings.json
 data template.json
 presets.json
 _mail_dump_runs.json

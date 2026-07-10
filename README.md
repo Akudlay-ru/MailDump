@@ -1,6 +1,6 @@
 # MailDump
 
-Current release: `0.0.6`.
+Current release: `0.1.2`.
 
 > IMAP mail → clean Markdown digest → structured analysis inside Obsidian.
 
@@ -11,6 +11,20 @@ It is built for people who do not need another pretty mailbox. They need a contr
 No CSV graveyard. No fake AI magic. No black-box sync. Just mail pulled into a vault in a form that can be inspected, reused, archived and analyzed.
 
 ---
+
+## Release 0.1.2
+
+- Added a configurable MailDump settings JSON path.
+- Keeps the default settings file in the plugin folder, with optional external storage.
+- When external storage is enabled, the plugin data file stores only the external settings path.
+
+## Release 0.1.1
+
+- Added support for 2-4 independent IMAP mailbox accounts.
+- Stores each mailbox account in its own child folder under the MailDump output root.
+- Binds every preset to one mailbox account, with account-specific IMAP folder loading.
+- Added explicit mailbox check and save controls for account settings.
+- Restored the visible MailDump title in the settings tab and documented the multi-account workflow.
 
 ## Release 0.0.6
 
@@ -44,11 +58,13 @@ MailDump is not an email client. It does not replace your mailbox. It extracts t
 
 | Area | What MailDump does |
 |---|---|
-| IMAP | Connects directly to an IMAP mailbox from Obsidian desktop. |
-| Folders | Loads and exports selected IMAP folders. |
+| Accounts | Supports 2-4 independent IMAP mailbox accounts. |
+| IMAP | Connects directly to IMAP mailboxes from Obsidian desktop. |
+| Folders | Loads and exports selected IMAP folders for the selected account. |
 | Periods | Supports today, yesterday, work week, last 7 days, last 30 days and custom ranges. |
 | Digest | Creates one analysis-ready `.md` digest. |
-| Presets | Stores presets in Obsidian plugin `data.json`. |
+| Presets | Binds every preset to one mailbox account. |
+| Settings file | Stores settings and presets in the default plugin data file or an external JSON file. |
 | Import / export | Allows separate JSON import and export of presets. |
 | Threads | Builds subject-based thread keys from normalized subjects. |
 | Metadata | Keeps UID, folder, direction, date, sender, recipients, Message-ID, References and flags. |
@@ -150,11 +166,13 @@ Open MailDump settings and configure:
 
 | Setting | Meaning |
 |---|---|
+| Mailbox accounts | Separate account list with per-account connection data and child output folders. |
 | IMAP host | Mail server address, for example `imap.yandex.ru`. |
 | IMAP port | Usually `993`. |
 | Login | Mail account login. |
 | App-password mode | How MailDump handles the IMAP app-password. |
 | App-password | Required only if local storage is selected. |
+| Settings file | Optional external JSON file for MailDump settings and presets. |
 | Additional user addresses | Used to detect incoming / outgoing / CC messages. |
 | Key contact email | Optional counter for a specific contact. |
 | Output folder | Default: `MailDump`. |
@@ -164,13 +182,25 @@ Use an app-password from your mail provider. Do not use the main account passwor
 
 ---
 
+## Settings file
+
+By default, MailDump stores its settings and presets in the Obsidian plugin data file:
+
+```text
+<your-vault>/.obsidian/plugins/maildump/data.json
+```
+
+In `Settings -> MailDump -> General`, you can set an external JSON settings file. When an external path is enabled, the standard plugin `data.json` stores only the external path, while MailDump settings, presets and locally stored app-passwords are written to the selected JSON file.
+
+---
+
 ## App-password modes
 
 MailDump supports three app-password modes:
 
 | Mode | Result |
 |---|---|
-| Store in `data.json` | The app-password is stored locally in Obsidian plugin data. Convenient, but you must not publish the file. |
+| Store in settings file | The app-password is stored locally in the active MailDump settings JSON file. Convenient, but you must not publish the file. |
 | Ask every time | The app-password is requested before each IMAP operation and is not saved. Safest, least convenient. |
 | Remember for session | The app-password is requested once and kept only until Obsidian is restarted. Balanced mode. |
 
@@ -180,6 +210,7 @@ Never publish:
 
 ```text
 data.json
+maildump-settings.json
 _mail_dump_runs.json
 MailDump/
 ```
