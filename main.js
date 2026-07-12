@@ -1,5 +1,5 @@
 /* ============================================================================
- * MailDump v0.1.2
+ * MailDump v0.1.9
  * First public compliance build.
  *
  * Desktop-only Obsidian plugin for exporting IMAP mail into analysis-ready
@@ -16,6 +16,7 @@ const { TextDecoder } = require('util');
 const VIEW_TYPE = 'maildump-panel';
 const PLUGIN_ID = 'maildump';
 const RUN_LOG_FILE = '_mail_dump_runs.json';
+const RUN_LOCK_FILE = '.maildump-run.lock';
 const DEFAULT_ACCOUNT_ID = 'account_default';
 const SETTINGS_FILE_BOOTSTRAP_KEY = 'settingsFilePath';
 
@@ -28,6 +29,10 @@ const DEFAULT_SETTINGS = {
   appPassword: '',
   appPasswordMode: 'store',
   outputFolder: 'MailDump',
+  draftsRootFolder: 'Day/Drafts',
+  draftTemplatePath: 'Шаблоны/MailDump Draft.md',
+  draftDefaultSignature: '',
+  draftMoveUploaded: true,
   connectTimeoutMs: 60000,
   commandTimeoutMs: 60000,
   maxMessagesWarning: 300,
@@ -83,6 +88,7 @@ function normalizeAccount(raw, fallback = {}) {
     username,
     appPassword: String(source.appPassword ?? fallback.appPassword ?? ''),
     appPasswordMode: allowedPasswordMode(source.appPasswordMode || fallback.appPasswordMode || 'store'),
+    draftsMailbox: String(source.draftsMailbox ?? fallback.draftsMailbox ?? 'Drafts').trim() || 'Drafts',
     userAliases: String(source.userAliases ?? fallback.userAliases ?? ''),
     keyContactEmail: String(source.keyContactEmail ?? fallback.keyContactEmail ?? ''),
     tlsRejectUnauthorized: !!(source.tlsRejectUnauthorized ?? fallback.tlsRejectUnauthorized ?? false)
@@ -181,14 +187,167 @@ function sha1(value) { return crypto.createHash('sha1').update(String(value || '
 function hmac8(salt, value) { return crypto.createHmac('sha256', salt).update(String(value || '')).digest('hex').slice(0, 8); }
 function ensureFolder(folderPath) { if (!fs.existsSync(folderPath)) fs.mkdirSync(folderPath, { recursive: true }); }
 function fileExists(p) { try { return fs.existsSync(p); } catch { return false; } }
-function readJsonFile(filePath, fallback) { try { return fileExists(filePath) ? JSON.parse(fs.readFileSync(filePath, 'utf8')) : fallback; } catch { return fallback; } }
+function parseJsonText(text) { return JSON.parse(String(text == null ? '' : text).replace(/^\uFEFF/, '')); }
+function readJsonFile(filePath, fallback) { try { return fileExists(filePath) ? parseJsonText(fs.readFileSync(filePath, 'utf8')) : fallback; } catch { return fallback; } }
+function readJsonFileStrict(filePath) {
+  if (!fileExists(filePath)) {
+    const error = new Error(`JSON file not found: ${filePath}`);
+    error.code = 'ENOENT';
+    throw error;
+  }
+  try {
+    return parseJsonText(fs.readFileSync(filePath, 'utf8'));
+  } catch (error) {
+    const wrapped = new Error(`Cannot read JSON file ${filePath}: ${error?.message || error}`);
+    wrapped.code = error?.code || 'INVALID_JSON';
+    wrapped.cause = error;
+    throw wrapped;
+  }
+}
 function writeJsonFile(filePath, value) { ensureFolder(path.dirname(filePath)); fs.writeFileSync(filePath, JSON.stringify(value, null, 2), 'utf8'); }
+function writeJsonFileAtomic(filePath, value) {
+  ensureFolder(path.dirname(filePath));
+  const tempPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    fs.writeFileSync(tempPath, JSON.stringify(value, null, 2), 'utf8');
+    try {
+      fs.renameSync(tempPath, filePath);
+    } catch (error) {
+      if (!['EEXIST', 'EPERM', 'EACCES'].includes(error?.code)) throw error;
+      fs.copyFileSync(tempPath, filePath);
+      fs.unlinkSync(tempPath);
+    }
+  } finally {
+    try { if (fileExists(tempPath)) fs.unlinkSync(tempPath); } catch {}
+  }
+}
+function compactError(error) {
+  const code = error?.code ? ` [${error.code}]` : '';
+  return `${String(error?.message || error || 'Unknown error')}${code}`;
+}
 function toRel(basePath, abs) { return path.relative(basePath, abs).replace(/\\/g, '/'); }
 function relToAbs(basePath, relOrAbs) { return path.isAbsolute(relOrAbs) ? relOrAbs : path.join(basePath, relOrAbs); }
 function normalizeAbsPath(basePath, input) {
   const value = String(input || '').trim();
   if (!value) return '';
   return path.normalize(path.isAbsolute(value) ? value : path.join(basePath, value));
+}
+class MailDumpHeadlessError extends Error {
+  constructor(code, message, options = {}) {
+    super(message);
+    this.name = 'MailDumpHeadlessError';
+    this.code = code;
+    this.exitCode = Number(options.exitCode || 2);
+    this.details = options.details || null;
+  }
+}
+function readHeadlessJson(filePath, code) {
+  if (!fileExists(filePath)) throw new MailDumpHeadlessError(code, `MailDump JSON not found: ${filePath}`);
+  try {
+    return parseJsonText(fs.readFileSync(filePath, 'utf8'));
+  } catch {
+    throw new MailDumpHeadlessError(code, `MailDump JSON is invalid: ${filePath}`);
+  }
+}
+function loadHeadlessState(basePath) {
+  const pluginDataPath = path.join(basePath, '.obsidian', 'plugins', PLUGIN_ID, 'data.json');
+  const bootstrap = readHeadlessJson(pluginDataPath, 'settings_not_found');
+  const settingsPath = normalizeAbsPath(basePath, bootstrap?.[SETTINGS_FILE_BOOTSTRAP_KEY] || '') || pluginDataPath;
+  const raw = settingsPath === pluginDataPath ? bootstrap : readHeadlessJson(settingsPath, 'external_settings_not_found');
+  const dataCache = raw && typeof raw === 'object' ? { ...raw } : {};
+  delete dataCache[SETTINGS_FILE_BOOTSTRAP_KEY];
+  const sourceSettings = dataCache.settings && typeof dataCache.settings === 'object' ? dataCache.settings : dataCache;
+  const settings = Object.assign({}, DEFAULT_SETTINGS, sourceSettings || {});
+  if (settings.password && !settings.appPassword) settings.appPassword = settings.password;
+  delete settings.password;
+  migrateAccounts(settings);
+  dataCache.settings = settings;
+  const memoryPlugin = { dataCache, settings, persistData() {} };
+  const presets = new PresetStore(memoryPlugin).load();
+  return { basePath, settingsPath, dataCache, settings, presets };
+}
+function selectHeadlessPreset(settings, presets, selector = '') {
+  const accounts = migrateAccounts(settings || {});
+  const value = String(selector || '').trim();
+  if (!value) {
+    const account = accounts[0];
+    const preset = (presets || []).find(item => item.accountId === account?.id);
+    if (!account || !preset) throw new MailDumpHeadlessError('default_preset_not_found', 'The first mailbox has no preset');
+    return { account, preset };
+  }
+  const byId = (presets || []).find(item => String(item.id || '') === value);
+  const normalized = value.toLowerCase();
+  const matches = byId ? [byId] : (presets || []).filter(item => String(item.name || '').trim().toLowerCase() === normalized);
+  if (!matches.length) throw new MailDumpHeadlessError('preset_not_found', `Preset not found: ${value}`);
+  if (matches.length > 1) {
+    const candidates = matches.map(item => {
+      const account = accounts.find(candidate => candidate.id === item.accountId);
+      return { presetId: item.id, presetName: item.name, accountId: item.accountId, accountName: accountDisplayName(account) };
+    });
+    throw new MailDumpHeadlessError('ambiguous_preset', `Preset name is ambiguous: ${value}`, { details: { candidates } });
+  }
+  const preset = matches[0];
+  const account = accounts.find(item => item.id === preset.accountId);
+  if (!account) throw new MailDumpHeadlessError('preset_account_not_found', `Preset account not found: ${preset.accountId}`);
+  return { account, preset };
+}
+function validateHeadlessSelection(account, preset) {
+  if (!account?.imapHost || !account?.username) throw new MailDumpHeadlessError('account_incomplete', 'Mailbox host or username is missing');
+  if ((account.appPasswordMode || 'store') !== 'store') throw new MailDumpHeadlessError('password_mode_unsupported', 'Headless mode requires a stored app-password');
+  if (!account.appPassword) throw new MailDumpHeadlessError('password_missing', 'Stored app-password is missing');
+  if (!Array.isArray(preset?.source?.mailboxes) || !preset.source.mailboxes.length) throw new MailDumpHeadlessError('mailboxes_missing', 'Preset has no IMAP folders');
+}
+function processIsAlive(pid) {
+  if (!Number.isInteger(Number(pid)) || Number(pid) <= 0) return false;
+  try { process.kill(Number(pid), 0); return true; }
+  catch (error) { return error?.code === 'EPERM'; }
+}
+function runLockPath(basePath) {
+  return path.join(basePath, '.obsidian', 'plugins', PLUGIN_ID, RUN_LOCK_FILE);
+}
+function acquireRunLock(basePath, source = 'obsidian') {
+  const filePath = runLockPath(basePath);
+  ensureFolder(path.dirname(filePath));
+  const owner = { pid: process.pid, startedAt: new Date().toISOString(), source: String(source || 'unknown') };
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      fs.writeFileSync(filePath, JSON.stringify(owner), { encoding: 'utf8', flag: 'wx' });
+      return { filePath, owner };
+    } catch (error) {
+      if (error?.code !== 'EEXIST') throw error;
+      const current = readJsonFile(filePath, {});
+      if (processIsAlive(Number(current?.pid))) {
+        throw new MailDumpHeadlessError('busy', 'Another MailDump export is already running', {
+          exitCode: 3,
+          details: { source: current?.source || 'unknown', startedAt: current?.startedAt || '' }
+        });
+      }
+      try { fs.unlinkSync(filePath); }
+      catch {
+        throw new MailDumpHeadlessError('busy', 'MailDump lock cannot be cleared', { exitCode: 3 });
+      }
+    }
+  }
+  throw new MailDumpHeadlessError('busy', 'Another MailDump export is already running', { exitCode: 3 });
+}
+function releaseRunLock(lock) {
+  if (!lock?.filePath) return;
+  const current = readJsonFile(lock.filePath, null);
+  if (current?.pid === lock.owner?.pid && current?.startedAt === lock.owner?.startedAt) {
+    try { fs.unlinkSync(lock.filePath); } catch {}
+  }
+}
+async function withMailDumpRunLock(basePath, source, work) {
+  const lock = acquireRunLock(basePath, source);
+  try { return await work(); }
+  finally { releaseRunLock(lock); }
+}
+function redactHeadlessText(value, secrets = []) {
+  let text = String(value || '');
+  for (const secret of secrets) {
+    if (secret) text = text.split(String(secret)).join('[redacted]');
+  }
+  return text;
 }
 function sanitizeFileName(name) {
   let s = String(name || 'untitled').replace(/[<>:"/\\|?*]/g, '_').trim().replace(/[. ]+$/g, '');
@@ -264,6 +423,400 @@ function attachmentAllowed(filename, preset) {
   if (exts.includes('*')) return true;
   const ext = normalizeExt(path.extname(String(filename || '')).replace(/^\./, ''));
   return !!ext && exts.includes(ext);
+}
+function normalizeDraftRelPath(value, fallback) {
+  const raw = String(value || fallback || '').trim().replace(/\\/g, '/').replace(/^\/+/, '');
+  return raw.replace(/\/{2,}/g, '/').replace(/\/+$/g, '') || fallback || '';
+}
+function normalizeVaultRelativePath(basePath, value, fallback) {
+  const safeFallback = normalizeDraftRelPath(fallback, fallback);
+  const raw = String(value || safeFallback || '').trim();
+  if (!raw) return safeFallback;
+  if (/^[A-Za-z]:[\\/]/.test(raw) && process.platform !== 'win32') return safeFallback;
+  const base = path.resolve(String(basePath || '.'));
+  const candidate = path.resolve(base, raw);
+  const relative = path.relative(base, candidate);
+  if (!relative || relative === '.') return safeFallback;
+  if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return safeFallback;
+  return normalizeDraftRelPath(relative, safeFallback);
+}
+function draftsRootFolder(settings) { return normalizeDraftRelPath(settings?.draftsRootFolder, 'Day/Drafts'); }
+function draftTemplatePath(settings) { return normalizeDraftRelPath(settings?.draftTemplatePath, 'Шаблоны/MailDump Draft.md'); }
+function accountDraftFolderRel(settings, account) {
+  return `${draftsRootFolder(settings)}/${accountFolderName(account)}`.replace(/\/{2,}/g, '/');
+}
+function isDraftPlaceholderLine(line) {
+  const s = String(line || '').trim().replace(/^[-*+]\s+/, '').trim();
+  return /^\[[^\]]+\]$/.test(s);
+}
+function isDraftHintLine(line) { return /^\s*>\s*/.test(String(line || '')); }
+function isDraftFormMarkupLine(line) {
+  return /^\s*<\/?(details|summary)\b/i.test(String(line || ''));
+}
+function cleanDraftLines(lines, options = {}) {
+  const kept = [];
+  for (const line of lines || []) {
+    if (isDraftHintLine(line) || isDraftPlaceholderLine(line) || isDraftFormMarkupLine(line)) continue;
+    kept.push(String(line || '').replace(/\r/g, ''));
+  }
+  while (kept.length && !kept[0].trim()) kept.shift();
+  while (kept.length && !kept[kept.length - 1].trim()) kept.pop();
+  if (options.keepBlankLines) return kept.join('\n').replace(/\n{4,}/g, '\n\n\n').trim();
+  return kept.map(x => x.trim()).filter(Boolean).join('\n').trim();
+}
+function draftHeadingKey(raw) {
+  const value = String(raw || '').trim().toLowerCase().replace(/ё/g, 'е');
+  const map = {
+    'тема письма': 'subject',
+    'кому': 'to',
+    'копия': 'cc',
+    'вложения': 'attachments',
+    'текст письма': 'body',
+    'подпись': 'signature',
+    'скрытая копия': 'bcc',
+    'важное': 'important',
+    'ответ на письмо': 'inReplyTo',
+    'ссылки на цепочку': 'references',
+    'метки': 'labels'
+  };
+  return map[value] || '';
+}
+function parseDraftSections(markdown) {
+  const sections = {};
+  let current = '';
+  for (const line of String(markdown || '').replace(/\r/g, '').split('\n')) {
+    const heading = /^(#{1,6})\s+(.+?)\s*$/.exec(line);
+    if (heading) {
+      current = draftHeadingKey(heading[2]);
+      if (current && !sections[current]) sections[current] = [];
+      continue;
+    }
+    if (current) sections[current].push(line);
+  }
+  return sections;
+}
+function extractDraftAttachmentRefs(text) {
+  const refs = [];
+  for (const raw of String(text || '').split('\n')) {
+    let line = raw.trim().replace(/^[-*+]\s+/, '').trim();
+    if (!line || isDraftPlaceholderLine(line)) continue;
+    let matched = false;
+    for (const m of line.matchAll(/!?\[\[([^\]]+)\]\]/g)) {
+      const ref = String(m[1] || '').split('|')[0].trim();
+      if (ref) refs.push(ref);
+      matched = true;
+    }
+    for (const m of line.matchAll(/\[[^\]]*\]\(([^)]+)\)/g)) {
+      const ref = decodeURIComponent(String(m[1] || '').trim());
+      if (ref) refs.push(ref);
+      matched = true;
+    }
+    if (!matched) {
+      line = line.replace(/^["']|["']$/g, '').trim();
+      if (line) refs.push(line);
+    }
+  }
+  return refs;
+}
+function parseDraftMarkdown(markdown) {
+  const sections = parseDraftSections(markdown);
+  const subject = cleanDraftLines(sections.subject || []).replace(/\n+/g, ' ').trim();
+  const body = cleanDraftLines(sections.body || [], { keepBlankLines: true });
+  const signature = cleanDraftLines(sections.signature || [], { keepBlankLines: true });
+  const importantRaw = cleanDraftLines(sections.important || []).toLowerCase();
+  return {
+    subject,
+    to: splitTerms(cleanDraftLines(sections.to || [])),
+    cc: splitTerms(cleanDraftLines(sections.cc || [])),
+    bcc: splitTerms(cleanDraftLines(sections.bcc || [])),
+    attachments: extractDraftAttachmentRefs(cleanDraftLines(sections.attachments || [], { keepBlankLines: true })),
+    important: /^(да|yes|true|1|важно|important|high)$/i.test(importantRaw),
+    inReplyTo: cleanDraftLines(sections.inReplyTo || []).trim(),
+    references: cleanDraftLines(sections.references || []).trim(),
+    labels: splitTerms(cleanDraftLines(sections.labels || [])),
+    body,
+    signature
+  };
+}
+function draftAddressLine(values) {
+  return Array.isArray(values) ? values.map(x => String(x || '').trim()).filter(Boolean).join(', ') : String(values || '').trim();
+}
+function encodeMimeHeader(value) {
+  const text = String(value || '').replace(/[\r\n]+/g, ' ').trim();
+  if (!text) return '';
+  if (/^[\x20-\x7E]+$/.test(text)) return text;
+  return `=?UTF-8?B?${Buffer.from(text, 'utf8').toString('base64')}?=`;
+}
+function draftHeaderValue(value) { return String(value || '').replace(/[\r\n]+/g, ' ').trim(); }
+function mimeLineBreaks(value) { return String(value || '').replace(/\r/g, '').replace(/\n/g, '\r\n'); }
+function base64MimeLines(buffer) {
+  return Buffer.from(buffer || Buffer.alloc(0)).toString('base64').replace(/.{1,76}/g, '$&\r\n').trim();
+}
+function contentTypeForFilename(filename) {
+  const ext = normalizeExt(path.extname(String(filename || '')).replace(/^\./, ''));
+  const map = {
+    txt: 'text/plain',
+    md: 'text/markdown',
+    pdf: 'application/pdf',
+    doc: 'application/msword',
+    docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    xls: 'application/vnd.ms-excel',
+    xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    csv: 'text/csv',
+    png: 'image/png',
+    jpg: 'image/jpeg',
+    jpeg: 'image/jpeg',
+    zip: 'application/zip'
+  };
+  return map[ext] || 'application/octet-stream';
+}
+function buildDraftMimeMessage({ draft, account, attachments = [], now = new Date(), messageIdSeed = '' }) {
+  const d = draft || {};
+  const from = draftHeaderValue(account?.username || account?.email || '');
+  const domain = (extractEmails(from)[0] || 'maildump.local').split('@')[1] || 'maildump.local';
+  const messageId = `<maildump-${messageIdSeed || now.getTime()}-${crypto.randomBytes(3).toString('hex')}@${domain}>`;
+  const headers = [
+    ['From', from],
+    ['To', draftAddressLine(d.to)],
+    ['Cc', draftAddressLine(d.cc)],
+    ['Bcc', draftAddressLine(d.bcc)],
+    ['Subject', encodeMimeHeader(d.subject || '')],
+    ['Date', now.toUTCString()],
+    ['Message-ID', messageId],
+    ['In-Reply-To', draftHeaderValue(d.inReplyTo || '')],
+    ['References', draftHeaderValue(d.references || d.inReplyTo || '')],
+    ['MIME-Version', '1.0'],
+    ['X-Mailer', 'MailDump']
+  ].filter(([, value]) => value);
+  if (d.important) {
+    headers.push(['Importance', 'high']);
+    headers.push(['X-Priority', '1']);
+  }
+  if (Array.isArray(d.labels) && d.labels.length) headers.push(['X-Keywords', d.labels.map(draftHeaderValue).filter(Boolean).join(', ')]);
+
+  const textBody = [d.body || '', d.signature || ''].map(x => String(x || '').trim()).filter(Boolean).join('\r\n\r\n');
+  const headerText = headers.map(([k, v]) => `${k}: ${v}`).join('\r\n');
+  if (!attachments.length) {
+    return Buffer.from(`${headerText}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n${mimeLineBreaks(textBody)}\r\n`, 'utf8');
+  }
+  const boundary = `maildump_${now.getTime()}_${crypto.randomBytes(4).toString('hex')}`;
+  const parts = [];
+  parts.push(`--${boundary}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n${mimeLineBreaks(textBody)}\r\n`);
+  for (const att of attachments) {
+    const filename = sanitizeFileName(att.filename || 'attachment.bin');
+    const contentType = att.contentType || contentTypeForFilename(filename);
+    parts.push(`--${boundary}\r\nContent-Type: ${contentType}; name="${encodeMimeHeader(filename)}"\r\nContent-Transfer-Encoding: base64\r\nContent-Disposition: attachment; filename="${encodeMimeHeader(filename)}"\r\n\r\n${base64MimeLines(att.data)}\r\n`);
+  }
+  parts.push(`--${boundary}--\r\n`);
+  return Buffer.from(`${headerText}\r\nContent-Type: multipart/mixed; boundary="${boundary}"\r\n\r\n${parts.join('')}`, 'utf8');
+}
+function normalizeDraftAttachmentRef(ref) {
+  return String(ref || '').trim().replace(/^["']|["']$/g, '').replace(/^<|>$/g, '');
+}
+function resolveDraftAttachmentRefs({ basePath, draftDir, refs }) {
+  const out = [];
+  for (const rawRef of refs || []) {
+    const ref = normalizeDraftAttachmentRef(rawRef);
+    if (!ref || isDraftPlaceholderLine(ref)) continue;
+    const candidates = path.isAbsolute(ref)
+      ? [ref]
+      : [path.join(basePath, ref), path.join(draftDir || basePath, ref)];
+    const abs = candidates.find(fileExists);
+    if (!abs) throw new Error(`Attachment not found: ${ref}`);
+    const stat = fs.statSync(abs);
+    if (!stat.isFile()) throw new Error(`Attachment is not a file: ${ref}`);
+    out.push({ path: abs, filename: path.basename(abs), contentType: contentTypeForFilename(abs), data: fs.readFileSync(abs) });
+  }
+  return out;
+}
+function createDraftTemplate(options = {}) {
+  const signature = String(options.defaultSignature || '').trim() || '[подпись]';
+  return [
+    '# Тема письма',
+    '',
+    '> Короткая тема письма.',
+    '',
+    '[тема письма]',
+    '',
+    '# Кому',
+    '',
+    '> Адреса получателей вида name@example.com через запятую.',
+    '',
+    '[адреса получателей]',
+    '',
+    '# Копия',
+    '',
+    '> Адреса получателей копии через запятую.',
+    '',
+    '[адреса копии]',
+    '',
+    '# Вложения',
+    '',
+    '> Ссылки на файлы, по одному файлу в строке.',
+    '',
+    '[вложения не указаны]',
+    '',
+    '<details>',
+    '<summary>Дополнительно</summary>',
+    '',
+    '## Скрытая копия',
+    '',
+    '> Адреса скрытой копии через запятую.',
+    '',
+    '[адреса скрытой копии]',
+    '',
+    '## Важное',
+    '',
+    'нет',
+    '',
+    '## Ответ на письмо',
+    '',
+    '> Message-ID письма, если это ответ.',
+    '',
+    '[message-id]',
+    '',
+    '## Ссылки на цепочку',
+    '',
+    '> References письма, если это ответ.',
+    '',
+    '[references]',
+    '',
+    '## Метки',
+    '',
+    '> Служебные метки через запятую.',
+    '',
+    '[метки]',
+    '',
+    '</details>',
+    '',
+    '# Текст письма',
+    '',
+    '> Напишите текст сообщения ниже.',
+    '',
+    '[текст письма]',
+    '',
+    '# Подпись',
+    '',
+    signature,
+    ''
+  ].join('\n');
+}
+function stripMarkdownFrontmatter(text) {
+  const source = String(text || '').replace(/\r/g, '');
+  if (!source.startsWith('---\n')) return source;
+  const end = source.indexOf('\n---', 4);
+  if (end === -1) return source;
+  const after = source.slice(end + 4);
+  return after.replace(/^\n+/, '');
+}
+function extractFirstH1(text) {
+  const lines = String(text || '').replace(/\r/g, '').split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    const m = /^#\s+(.+?)\s*$/.exec(lines[i]);
+    if (m) return { title: m[1].trim(), index: i };
+  }
+  return { title: '', index: -1 };
+}
+function removeLineAtIndex(text, index) {
+  const lines = String(text || '').replace(/\r/g, '').split('\n');
+  if (index >= 0 && index < lines.length) lines.splice(index, 1);
+  return lines.join('\n').replace(/^\n+/, '').trim();
+}
+function sourceFileTitle(sourcePath) {
+  return path.basename(String(sourcePath || 'Черновик'), path.extname(String(sourcePath || ''))).trim() || 'Черновик';
+}
+function draftAttachmentLink(sourcePath) {
+  return `[[${String(sourcePath || '').replace(/\\/g, '/')}]]`;
+}
+function createDraftMarkdownForm({ subject = '', to = '[адреса получателей]', cc = '[адреса копии]', attachments = ['[вложения не указаны]'], body = '[текст письма]', signature = '', bcc = '[адреса скрытой копии]', important = 'нет', inReplyTo = '[message-id]', references = '[references]', labels = '[метки]' } = {}) {
+  return [
+    '# Тема письма',
+    '',
+    '> Короткая тема письма.',
+    '',
+    subject || '[тема письма]',
+    '',
+    '# Кому',
+    '',
+    '> Адреса получателей вида name@example.com через запятую.',
+    '',
+    to || '[адреса получателей]',
+    '',
+    '# Копия',
+    '',
+    '> Адреса получателей копии через запятую.',
+    '',
+    cc || '[адреса копии]',
+    '',
+    '# Вложения',
+    '',
+    '> Ссылки на файлы, по одному файлу в строке.',
+    '',
+    ...(Array.isArray(attachments) ? attachments : [String(attachments || '[вложения не указаны]')]),
+    '',
+    '<details>',
+    '<summary>Дополнительно</summary>',
+    '',
+    '## Скрытая копия',
+    '',
+    '> Адреса скрытой копии через запятую.',
+    '',
+    bcc || '[адреса скрытой копии]',
+    '',
+    '## Важное',
+    '',
+    important || 'нет',
+    '',
+    '## Ответ на письмо',
+    '',
+    '> Message-ID письма, если это ответ.',
+    '',
+    inReplyTo || '[message-id]',
+    '',
+    '## Ссылки на цепочку',
+    '',
+    '> References письма, если это ответ.',
+    '',
+    references || '[references]',
+    '',
+    '## Метки',
+    '',
+    '> Служебные метки через запятую.',
+    '',
+    labels || '[метки]',
+    '',
+    '</details>',
+    '',
+    '# Текст письма',
+    '',
+    '> Напишите текст сообщения ниже.',
+    '',
+    body || '[текст письма]',
+    '',
+    '# Подпись',
+    '',
+    String(signature || '').trim() || '[подпись]',
+    ''
+  ].join('\n');
+}
+function createDraftMarkdownFromSourceFile({ sourcePath, content = '', settings = {} } = {}) {
+  const rel = String(sourcePath || '').replace(/\\/g, '/');
+  const ext = normalizeExt(path.extname(rel).replace(/^\./, ''));
+  const signature = String(settings?.draftDefaultSignature || '').trim();
+  if (ext === 'md' || ext === 'markdown') {
+    const withoutFrontmatter = stripMarkdownFrontmatter(Buffer.isBuffer(content) ? content.toString('utf8') : content);
+    const firstH1 = extractFirstH1(withoutFrontmatter);
+    const subject = firstH1.title || sourceFileTitle(rel);
+    const body = firstH1.index >= 0 ? removeLineAtIndex(withoutFrontmatter, firstH1.index) : String(withoutFrontmatter || '').trim();
+    return createDraftMarkdownForm({ subject, body: body || '[текст письма]', signature });
+  }
+  return createDraftMarkdownForm({
+    subject: sourceFileTitle(rel),
+    attachments: [`- ${draftAttachmentLink(rel)}`],
+    body: '[текст письма]',
+    signature,
+    labels: 'source-file'
+  });
 }
 function formatFileTimePrefix(date, uid) {
   const d = Number.isFinite(date.getTime()) ? date : new Date();
@@ -832,13 +1385,24 @@ class PresetStore {
     const arr = raw || defaultPresets(accountId);
     const migrated = arr.map(p => migratePreset(p, accountId));
     if (!migrated.length) migrated.push(...defaultPresets(accountId));
-    if (!raw || JSON.stringify(raw) !== JSON.stringify(migrated)) this.save(migrated);
+    if (!raw || JSON.stringify(raw) !== JSON.stringify(migrated)) {
+      this.plugin.dataCache = this.plugin.dataCache || {};
+      this.plugin.dataCache.presets = migrated;
+      this.plugin.presetsNeedSave = true;
+    }
     return migrated;
   }
   save(presets) {
     this.plugin.dataCache = this.plugin.dataCache || {};
     this.plugin.dataCache.presets = presets || [];
-    this.plugin.persistData();
+    this.plugin.presetsNeedSave = false;
+    const pending = this.plugin.persistData();
+    if (pending && typeof pending.catch === 'function') {
+      pending.catch(error => {
+        console.error('[MailDump] preset persistence failed', error);
+        try { new Notice(`MailDump: пресет не сохранён: ${compactError(error)}`, 12000); } catch {}
+      });
+    }
   }
   exportToFile(presets) {
     const basePath = this.plugin.app.vault.adapter.getBasePath();
@@ -1140,9 +1704,21 @@ class ImapClientM1 {
       this.pending.chunks.push(chunk);
       const buf = Buffer.concat(this.pending.chunks);
       const latin = buf.toString('latin1');
-      const doneRe = new RegExp(`\\r?\\n${this.pending.tag} (OK|NO|BAD)`, 'i');
-      if (doneRe.test(latin) || latin.startsWith(`${this.pending.tag} `)) {
-        const p = this.pending;
+      const p = this.pending;
+      if (p.literal && !p.literalSent && /(^|\r?\n)\+/.test(latin)) {
+        p.literalSent = true;
+        try {
+          this.socket.write(p.literal);
+          this.socket.write('\r\n');
+        } catch (error) {
+          this.pending = null;
+          if (p.timer) clearTimeout(p.timer);
+          p.reject(error);
+        }
+        return;
+      }
+      const doneRe = new RegExp(`\\r?\\n${p.tag} (OK|NO|BAD)`, 'i');
+      if (doneRe.test(latin) || latin.startsWith(`${p.tag} `)) {
         this.pending = null;
         if (p.timer) clearTimeout(p.timer);
         if (new RegExp(`${p.tag} OK`, 'i').test(latin)) p.resolve(buf);
@@ -1168,6 +1744,23 @@ class ImapClientM1 {
       this.socket.write(`${tag} ${cmd}\r\n`);
     });
   }
+  commandWithLiteral(cmd, literal) {
+    return new Promise((resolve, reject) => {
+      if (!this.socket || this.closed) return reject(new Error('IMAP socket is not connected'));
+      if (this.pending) return reject(new Error('IMAP command already pending'));
+      const tag = 'A' + String(this.tag++).padStart(4, '0');
+      const timeoutMs = Number(this.settings.commandTimeoutMs || 60000);
+      const payload = Buffer.isBuffer(literal) ? literal : Buffer.from(String(literal || ''), 'utf8');
+      const timer = timeoutMs > 0 ? setTimeout(() => {
+        const p = this.pending;
+        this.pending = null;
+        try { this.socket.destroy(new Error('IMAP command timeout')); } catch {}
+        if (p) p.reject(new Error(`IMAP command timeout: ${cmd.slice(0, 80)}`));
+      }, timeoutMs) : null;
+      this.pending = { tag, chunks: [], timer, resolve, reject, literal: payload, literalSent: false };
+      this.socket.write(`${tag} ${cmd} {${payload.length}}\r\n`);
+    });
+  }
   async login() { await this.command(`LOGIN ${quoteImap(this.settings.username)} ${quoteImap(this.settings.appPassword)}`); }
   async logout() { try { await this.command('LOGOUT'); } catch {} try { this.socket.end(); } catch {} this.closed = true; }
   abort() { try { this.socket.destroy(new Error('cancelled')); } catch {} this.closed = true; }
@@ -1185,6 +1778,10 @@ class ImapClientM1 {
     return out.sort((a, b) => a.localeCompare(b, 'ru'));
   }
   async select(mailbox) { await this.command(`SELECT ${quoteImap(mailbox)}`); }
+  async append(mailbox, message, flags = ['\\Draft']) {
+    const flagText = Array.isArray(flags) && flags.length ? ` (${flags.join(' ')})` : '';
+    return this.commandWithLiteral(`APPEND ${quoteImap(mailbox)}${flagText}`, message);
+  }
   async searchByDate(from, to) {
     const buf = await this.command(`UID SEARCH ${buildDateCriteria(from, to)}`);
     const line = buf.toString('latin1').split(/\r?\n/).find(x => x.startsWith('* SEARCH')) || '* SEARCH';
@@ -1616,10 +2213,13 @@ function writeMailRecordWithAttachments({ basePath, outputAbs, preset, record, r
 }
 
 class ExportService {
-  constructor(plugin) { this.plugin = plugin; }
+  constructor(plugin, options = {}) {
+    this.plugin = plugin;
+    this.clientFactory = options.clientFactory || (settings => new ImapClientM1(settings));
+  }
   async makeClient(account, runtimeSettings = null) {
     const settings = runtimeSettings || await this.plugin.resolveRuntimeSettingsForAccount(account);
-    const client = new ImapClientM1(settings);
+    const client = this.clientFactory(settings);
     this.plugin.activeClient = client;
     try { await client.connect(); await client.login(); return client; }
     catch (e) { try { client.abort(); } catch {} this.plugin.activeClient = null; throw e; }
@@ -1685,6 +2285,10 @@ class ExportService {
     }
   }
   async runPreset(preset) {
+    const basePath = this.plugin.app.vault.adapter.getBasePath();
+    return withMailDumpRunLock(basePath, this.plugin.runSource || 'obsidian', () => this.runPresetUnlocked(preset));
+  }
+  async runPresetUnlocked(preset) {
     const account = this.plugin.getPresetAccount(preset);
     const token = this.plugin.ops.start('export', { text: `Старт сводки: ${preset.name} · ${accountDisplayName(account)}`, progress: 0, progressMode: 'indeterminate', presetName: preset.name });
     let client = null;
@@ -1734,7 +2338,7 @@ class ExportService {
           try {
             fetched = await client.fetchTextOnly(uid, { saveAttachments: shouldSaveAttachments(preset), allowedAttachment: filename => attachmentAllowed(filename, preset) });
           } catch (e) {
-            runEntry.errors.push({ mailbox, uid, error: e.message || String(e) });
+            runEntry.errors.push({ mailbox, uid, error: redactHeadlessText(e.message || e, [runtimeSettings?.appPassword]) });
             runEntry.counts.errors += 1;
             if (token.cancelled) throw new Error('Операция остановлена пользователем');
             if (client && client.closed) {
@@ -1754,7 +2358,7 @@ class ExportService {
               records.push(record);
             }
           } catch (e) {
-            runEntry.errors.push({ mailbox, uid: fetched.uid || uid, error: e.message || String(e) });
+            runEntry.errors.push({ mailbox, uid: fetched.uid || uid, error: redactHeadlessText(e.message || e, [runtimeSettings?.appPassword]) });
             runEntry.counts.errors += 1;
           }
           processed += 1;
@@ -1799,19 +2403,197 @@ class ExportService {
           fs.writeFileSync(abs, digest, 'utf8');
           runEntry.filesCreated.push(toRel(basePath, abs));
           runEntry.counts.written = runEntry.filesCreated.length;
-        } catch (writeError) { runEntry.errors.push({ error: `partial write failed: ${writeError.message || writeError}` }); }
+        } catch (writeError) { runEntry.errors.push({ error: `partial write failed: ${redactHeadlessText(writeError.message || writeError, [runtimeSettings?.appPassword])}` }); }
       }
       runEntry.finishedAt = formatDateTime(new Date());
       runEntry.status = records.length && status !== 'error' ? 'partial' : status;
-      runEntry.errors.push({ error: e.message || String(e) });
+      runEntry.errors.push({ error: redactHeadlessText(e.message || e, [runtimeSettings?.appPassword]) });
       runEntry.counts.afterFilters = records.length;
       new RunLogStore(this.plugin).append(runEntry);
+      e.maildumpRunEntry = runEntry;
       throw e;
     } finally {
       if (client && !client.closed) { try { await client.logout(); } catch {} }
       this.plugin.activeClient = null;
       this.plugin.ops.finish(token, token.cancelled ? 'cancelled' : 'completed');
     }
+  }
+}
+
+class DraftUploadService {
+  constructor(plugin) { this.plugin = plugin; }
+  get basePath() { return this.plugin.app.vault.adapter.getBasePath(); }
+  templateAbs() { return relToAbs(this.basePath, draftTemplatePath(this.plugin.settings)); }
+  accountDraftFolderAbs(account) { return relToAbs(this.basePath, accountDraftFolderRel(this.plugin.settings, account)); }
+  uploadedFolderAbs(account) { return path.join(this.accountDraftFolderAbs(account), '_uploaded'); }
+  writeTemplate(overwrite = false) {
+    const abs = this.templateAbs();
+    ensureFolder(path.dirname(abs));
+    if (fileExists(abs) && !overwrite) return { path: abs, rel: toRel(this.basePath, abs), created: false };
+    fs.writeFileSync(abs, createDraftTemplate({ defaultSignature: this.plugin.settings.draftDefaultSignature || '' }), 'utf8');
+    return { path: abs, rel: toRel(this.basePath, abs), created: true };
+  }
+  ensureAccountFolder(account) {
+    const abs = this.accountDraftFolderAbs(account);
+    ensureFolder(abs);
+    ensureFolder(path.join(abs, 'files'));
+    return { path: abs, rel: toRel(this.basePath, abs) };
+  }
+  ensureAllFoldersAndTemplate(overwriteTemplate = false) {
+    const folders = [];
+    for (const account of this.plugin.getAccounts()) folders.push(this.ensureAccountFolder(account));
+    const template = this.writeTemplate(overwriteTemplate);
+    return { folders, template };
+  }
+  listDraftFiles(account) {
+    const folder = this.accountDraftFolderAbs(account);
+    if (!fileExists(folder)) return [];
+    return fs.readdirSync(folder)
+      .filter(name => /\.md$/i.test(name))
+      .map(name => path.join(folder, name))
+      .filter(abs => fs.statSync(abs).isFile())
+      .sort((a, b) => a.localeCompare(b));
+  }
+  inspectAccountFolder(account) {
+    const folder = this.ensureAccountFolder(account);
+    const files = this.listDraftFiles(account).map(abs => toRel(this.basePath, abs));
+    return { folder, files };
+  }
+  async readSourceFile(file) {
+    const rel = String(file?.path || '').replace(/\\/g, '/');
+    const ext = normalizeExt(path.extname(rel).replace(/^\./, ''));
+    if ((ext === 'md' || ext === 'markdown') && this.plugin.app?.vault?.read) return this.plugin.app.vault.read(file);
+    const abs = relToAbs(this.basePath, rel);
+    return fs.readFileSync(abs);
+  }
+  async createDraftFromSourceFile(file, account = null) {
+    if (!file || !file.path || file.children) throw new Error('MailDump: выберите файл, а не папку');
+    const selectedAccount = account || getAccountById(this.plugin.settings, this.plugin.settings.activeAccountId);
+    const content = await this.readSourceFile(file);
+    const draftMarkdown = createDraftMarkdownFromSourceFile({ sourcePath: file.path, content, settings: this.plugin.settings });
+    const draft = parseDraftMarkdown(draftMarkdown);
+    const folder = this.ensureAccountFolder(selectedAccount);
+    const name = uniqueFileName(folder.path, `${sanitizeFileName(draft.subject || sourceFileTitle(file.path))}.md`);
+    const abs = path.join(folder.path, name);
+    fs.writeFileSync(abs, draftMarkdown, 'utf8');
+    return { path: abs, rel: toRel(this.basePath, abs), subject: draft.subject, account: selectedAccount };
+  }
+  validateDraft(draft, rel) {
+    if (!draft.subject) throw new Error(`${rel}: не заполнена тема письма`);
+    if (!draft.to || !draft.to.length) throw new Error(`${rel}: не заполнено поле Кому`);
+  }
+  moveUploaded(abs, account) {
+    const destFolder = this.uploadedFolderAbs(account);
+    ensureFolder(destFolder);
+    const destName = uniqueFileName(destFolder, path.basename(abs));
+    const dest = path.join(destFolder, destName);
+    fs.renameSync(abs, dest);
+    return toRel(this.basePath, dest);
+  }
+  async uploadAccountDrafts(account) {
+    const basePath = this.basePath;
+    return withMailDumpRunLock(basePath, 'drafts', async () => {
+      const files = this.listDraftFiles(account);
+      const token = this.plugin.ops.start('draft_upload', { text: `Загрузка черновиков: ${accountDisplayName(account)}`, progress: 0, progressMode: 'percent' });
+      let client = null;
+      const uploaded = [];
+      const errors = [];
+      try {
+        if (!files.length) return { uploaded, errors, total: 0 };
+        client = await this.plugin.exportService.makeClient(account);
+        for (let i = 0; i < files.length; i++) {
+          const abs = files[i];
+          const rel = toRel(basePath, abs);
+          if (token.cancelled) throw new Error('Операция остановлена пользователем');
+          try {
+            const markdown = fs.readFileSync(abs, 'utf8');
+            const draft = parseDraftMarkdown(markdown);
+            this.validateDraft(draft, rel);
+            const attachments = resolveDraftAttachmentRefs({ basePath, draftDir: path.dirname(abs), refs: draft.attachments });
+            const message = buildDraftMimeMessage({ draft, account, attachments });
+            const flags = draft.important ? ['\\Draft', '\\Flagged'] : ['\\Draft'];
+            await client.append(account.draftsMailbox || 'Drafts', message, flags);
+            const archivedRel = this.plugin.settings.draftMoveUploaded !== false ? this.moveUploaded(abs, account) : rel;
+            uploaded.push({ source: rel, archived: archivedRel, attachments: attachments.map(a => toRel(basePath, a.path)) });
+            this.plugin.appendMessageHistory(`Черновик загружен: ${rel}`);
+          } catch (error) {
+            errors.push({ file: rel, error: error.message || String(error) });
+            this.plugin.appendMessageHistory(`Черновик не загружен: ${rel} · ${error.message || error}`);
+          }
+          this.plugin.ops.update({ progress: Math.round(((i + 1) / files.length) * 100), text: `Черновики: ${i + 1}/${files.length}` });
+        }
+        return { uploaded, errors, total: files.length };
+      } finally {
+        if (client && !client.closed) { try { await client.logout(); } catch {} }
+        if (this.plugin.activeClient === client) this.plugin.activeClient = null;
+        this.plugin.ops.finish(token, errors.length ? 'partial' : 'completed');
+      }
+    });
+  }
+}
+
+function formatHeadlessError(error, secrets = []) {
+  if (error instanceof MailDumpHeadlessError) return error;
+  const entry = error?.maildumpRunEntry || null;
+  const resultPath = entry?.filesCreated?.[entry.filesCreated.length - 1] || '';
+  const details = entry ? {
+    status: resultPath ? 'partial' : (entry.status || 'error'),
+    presetId: entry.presetId || '',
+    presetName: entry.presetName || '',
+    accountId: entry.accountId || '',
+    accountName: entry.accountName || '',
+    path: resultPath,
+    counts: entry.counts || {}
+  } : { status: 'error' };
+  return new MailDumpHeadlessError(
+    'export_failed',
+    redactHeadlessText(error?.message || error, secrets),
+    { exitCode: 4, details }
+  );
+}
+function createHeadlessPlugin(state, options = {}) {
+  const plugin = {
+    app: { vault: { adapter: { getBasePath: () => state.basePath } } },
+    settings: state.settings,
+    dataCache: state.dataCache,
+    runSource: options.source || 'cli',
+    activeClient: null,
+    messageHistory: [],
+    persistData() {},
+    appendMessageHistory(text) {
+      if (options.onProgress) options.onProgress(String(text || ''));
+    },
+    getPresetAccount(preset) { return getPresetAccount(this.settings, preset); },
+    abortActiveClient() { try { this.activeClient?.abort(); } catch {} },
+    async resolveRuntimeSettingsForAccount(account) {
+      validateHeadlessSelection(account, options.preset);
+      return getRuntimeSettingsForAccount(this.settings, account, account.appPassword);
+    }
+  };
+  plugin.ops = new OperationStore(plugin);
+  plugin.exportService = new ExportService(plugin, { clientFactory: options.clientFactory });
+  return plugin;
+}
+async function runHeadless(options = {}) {
+  const state = loadHeadlessState(options.basePath);
+  const selected = selectHeadlessPreset(state.settings, state.presets, options.selector || '');
+  validateHeadlessSelection(selected.account, selected.preset);
+  const secrets = migrateAccounts(state.settings).map(account => account.appPassword).filter(Boolean);
+  const plugin = createHeadlessPlugin(state, { ...options, preset: selected.preset });
+  try {
+    const result = await plugin.exportService.runPreset(selected.preset);
+    return {
+      ok: true,
+      status: result.runEntry.status,
+      presetId: result.runEntry.presetId,
+      presetName: result.runEntry.presetName,
+      accountId: result.runEntry.accountId,
+      accountName: result.runEntry.accountName,
+      path: result.path,
+      counts: result.runEntry.counts
+    };
+  } catch (error) {
+    throw formatHeadlessError(error, secrets);
   }
 }
 
@@ -1912,6 +2694,46 @@ function addIconButton(parent, icon, label, onClick, cls = '') {
   button.setAttr('data-icon', icon || '');
   button.onclick = onClick;
   return button;
+}
+
+function openVaultPathPicker(app, options = {}) {
+  const FuzzySuggestModal = require('obsidian')?.FuzzySuggestModal;
+  if (typeof FuzzySuggestModal !== 'function') throw new Error('Obsidian FuzzySuggestModal is unavailable');
+  const mode = options.mode === 'markdown' ? 'markdown' : 'folder';
+  const all = typeof app?.vault?.getAllLoadedFiles === 'function' ? app.vault.getAllLoadedFiles() : [];
+  const items = all.filter(item => {
+    if (!item || typeof item.path !== 'string') return false;
+    if (mode === 'folder') return Array.isArray(item.children);
+    return !Array.isArray(item.children) && (String(item.extension || '').toLowerCase() === 'md' || /\.md$/i.test(item.path));
+  }).sort((a, b) => String(a.path).localeCompare(String(b.path), 'ru'));
+  class VaultPathPicker extends FuzzySuggestModal {
+    getItems() { return items; }
+    getItemText(item) { return item.path || '/'; }
+    onChooseItem(item) {
+      Promise.resolve(options.onChoose?.(item.path || '')).catch(error => {
+        console.error('[MailDump] vault path picker failed', error);
+        try { new Notice(`MailDump: путь не применён: ${error?.message || error}`, 12000); } catch {}
+      });
+    }
+  }
+  const modal = new VaultPathPicker(app);
+  if (typeof modal.setPlaceholder === 'function') {
+    modal.setPlaceholder(options.placeholder || (mode === 'folder' ? 'Выберите папку vault' : 'Выберите Markdown-шаблон'));
+  }
+  modal.open();
+  return modal;
+}
+
+function addPathPickerRow(parent, label, value, onApply, pickLabel, onPick) {
+  const wrap = parent.createDiv({ cls: 'mail-dump-path-row' });
+  wrap.createDiv({ cls: 'mail-dump-path-label', text: label });
+  const controls = wrap.createDiv({ cls: 'mail-dump-path-controls' });
+  const input = controls.createEl('input', { type: 'text' });
+  input.value = String(value || '');
+  input.setAttr('spellcheck', 'false');
+  addCommandButton(controls, 'check', 'Применить', () => onApply(input.value));
+  addCommandButton(controls, 'folder-search', pickLabel, onPick);
+  return input;
 }
 
 class MailDumpView extends ItemView {
@@ -2237,7 +3059,8 @@ class MailDumpView extends ItemView {
       ['mailboxes', 'Папки'],
       ['filters', 'Фильтры'],
       ['output', 'Вывод'],
-      ['journal', 'Журнал']
+      ['journal', 'Журнал'],
+      ['drafts', 'Черновики']
     ];
   }
   compactBlock(parent, title, cls = '') {
@@ -2389,6 +3212,7 @@ class MailDumpView extends ItemView {
     if (this.activeTab === 'mailboxes') return this.renderMailboxesTab(parent);
     if (this.activeTab === 'filters') return this.renderFiltersTab(parent);
     if (this.activeTab === 'output') return this.renderOutputTab(parent);
+    if (this.activeTab === 'drafts') return this.renderDraftsTab(parent);
     if (this.activeTab === 'journal') return this.renderJournalTab(parent);
     return this.renderPresetTab(parent);
   }
@@ -2531,6 +3355,112 @@ class MailDumpView extends ItemView {
       addField(files, 'Подпапка', p.output.subfolder || '', v => { p.output.subfolder = v || ''; this.savePresets(); });
     }
   }
+  renderDraftsTab(parent) {
+    const account = getAccountById(this.plugin.settings, this.plugin.settings.activeAccountId);
+    const basePath = this.plugin.getVaultBasePath();
+    const applyPortablePath = async (settingKey, value, fallback) => {
+      this.plugin.settings[settingKey] = normalizeVaultRelativePath(basePath, value, fallback);
+      const saved = await this.plugin.saveSettings();
+      if (saved === false) return;
+      try {
+        this.plugin.draftBootstrapResult = this.plugin.draftUploadService.ensureAllFoldersAndTemplate(false);
+        this.plugin.draftBootstrapError = '';
+        new Notice(`MailDump: путь сохранён: ${this.plugin.settings[settingKey]}`);
+      } catch (error) {
+        this.plugin.draftBootstrapError = error?.message || String(error);
+        new Notice(`MailDump: путь сохранён, но структура не создана: ${this.plugin.draftBootstrapError}`, 12000);
+      }
+      this.render();
+    };
+
+    const accountBlock = this.compactBlock(parent, 'Почтовый ящик');
+    addSelect(accountBlock, 'Ящик для черновиков', this.plugin.getAccounts().map(a => [a.id, `${accountDisplayName(a)} · ${accountFolderName(a)}`]), account.id, async value => {
+      this.plugin.settings.activeAccountId = value;
+      await this.plugin.saveSettings();
+      this.render();
+    });
+
+    const paths = this.compactBlock(parent, 'Пути в vault');
+    paths.createDiv({ cls: 'mail-dump-note', text: 'Пути сохраняются относительно корня vault и переносятся между синхронизируемыми компьютерами.' });
+    addPathPickerRow(
+      paths,
+      'Папка черновиков',
+      draftsRootFolder(this.plugin.settings),
+      value => applyPortablePath('draftsRootFolder', value, 'Day/Drafts'),
+      'Выбрать папку',
+      () => openVaultPathPicker(this.plugin.app, {
+        mode: 'folder',
+        placeholder: 'Выберите папку для черновиков',
+        onChoose: value => applyPortablePath('draftsRootFolder', value, 'Day/Drafts')
+      })
+    );
+    addPathPickerRow(
+      paths,
+      'Markdown-шаблон',
+      draftTemplatePath(this.plugin.settings),
+      value => applyPortablePath('draftTemplatePath', value, 'Шаблоны/MailDump Draft.md'),
+      'Выбрать шаблон',
+      () => openVaultPathPicker(this.plugin.app, {
+        mode: 'markdown',
+        placeholder: 'Выберите Markdown-шаблон',
+        onChoose: value => applyPortablePath('draftTemplatePath', value, 'Шаблоны/MailDump Draft.md')
+      })
+    );
+    paths.createDiv({ cls: 'mail-dump-note', text: `Папка текущего ящика: ${accountDraftFolderRel(this.plugin.settings, account)}` });
+    if (this.plugin.draftBootstrapError) paths.createDiv({ cls: 'mail-dump-settings-error', text: `Автосоздание не выполнено: ${this.plugin.draftBootstrapError}` });
+    else if (this.plugin.draftBootstrapResult?.template) paths.createDiv({ cls: 'mail-dump-note', text: `Шаблон: ${this.plugin.draftBootstrapResult.template.rel}` });
+
+    const options = this.compactBlock(parent, 'Параметры черновиков');
+    addField(options, 'IMAP-папка черновиков', account.draftsMailbox || 'Drafts', async value => {
+      account.draftsMailbox = String(value || 'Drafts').trim() || 'Drafts';
+      this.plugin.settings.accounts = this.plugin.settings.accounts.map(item => item.id === account.id ? account : item);
+      await this.plugin.saveSettings();
+    });
+    addTextarea(options, 'Подпись по умолчанию', this.plugin.settings.draftDefaultSignature || '', async value => {
+      this.plugin.settings.draftDefaultSignature = value || '';
+      await this.plugin.saveSettings();
+    });
+    addCheck(options, 'После загрузки переносить .md в _uploaded', this.plugin.settings.draftMoveUploaded !== false, async value => {
+      this.plugin.settings.draftMoveUploaded = !!value;
+      await this.plugin.saveSettings();
+    });
+
+    const actions = this.compactBlock(parent, 'Действия');
+    const actionGrid = actions.createDiv({ cls: 'mail-dump-account-actions' });
+    addCommandButton(actionGrid, 'file-input', 'Превратить текущий файл в черновик', async () => {
+      try { await this.plugin.createDraftFromActiveFile(); }
+      catch (error) { new Notice(`MailDump: ${error?.message || error}`); }
+    }, 'mod-cta');
+    addCommandButton(actionGrid, 'file-plus', 'Создать / восстановить шаблон', () => {
+      try {
+        const templateAbs = this.plugin.draftUploadService.templateAbs();
+        const overwrite = fileExists(templateAbs) ? confirm('MailDump: шаблон уже существует. Перезаписать его текущей подписью?') : false;
+        const result = this.plugin.draftUploadService.ensureAllFoldersAndTemplate(overwrite);
+        this.plugin.draftBootstrapResult = result;
+        this.plugin.draftBootstrapError = '';
+        new Notice(result.template.created ? `MailDump: шаблон создан: ${result.template.rel}` : `MailDump: папки созданы, шаблон уже есть: ${result.template.rel}`);
+        this.render();
+      } catch (error) {
+        this.plugin.draftBootstrapError = error?.message || String(error);
+        new Notice(`MailDump: ${this.plugin.draftBootstrapError}`, 12000);
+        this.render();
+      }
+    }, 'mod-cta');
+    addCommandButton(actionGrid, 'folder-check', 'Проверить папку', () => {
+      try {
+        const result = this.plugin.draftUploadService.inspectAccountFolder(account);
+        new Notice(`MailDump: ${result.folder.rel}; .md: ${result.files.length}`);
+        this.plugin.appendMessageHistory(`Черновики: ${result.folder.rel}; .md: ${result.files.length}`);
+      } catch (error) { new Notice(`MailDump: ${error?.message || error}`, 12000); }
+    });
+    addCommandButton(actionGrid, 'upload', 'Загрузить черновики', async () => {
+      try {
+        const result = await this.plugin.draftUploadService.uploadAccountDrafts(account);
+        new Notice(`MailDump: загружено ${result.uploaded.length}/${result.total}, ошибок: ${result.errors.length}`);
+        this.render();
+      } catch (error) { new Notice(`MailDump: ${error?.message || error}`, 12000); }
+    }, 'mod-cta');
+  }
   renderJournalTab(parent) {
     const status = this.compactBlock(parent, 'Статус');
     this.journalCurrentEl = status.createDiv({ cls: 'mail-dump-status-current' });
@@ -2652,15 +3582,13 @@ class MailDumpSettingsTab extends PluginSettingTab {
     const body = shell.createDiv({ cls: 'mail-dump-tab-content' });
     if (this.activeSettingsTab === 'general') return this.renderGeneralSettingsTab(body);
     if (this.activeSettingsTab === 'webmail') return this.renderWebmailSettingsTab(body);
-    if (this.activeSettingsTab === 'commands') return this.renderCommandSettingsTab(body);
     return this.renderAccountsSettingsTab(body);
   }
   renderSettingsTabs(parent) {
     const tabs = [
       ['accounts', 'Ящики'],
       ['general', 'Общие'],
-      ['webmail', 'Веб-почта'],
-      ['commands', 'Команды']
+      ['webmail', 'Веб-почта']
     ];
     const tabbar = parent.createDiv({ cls: 'mail-dump-tabbar' });
     for (const [id, label] of tabs) {
@@ -2856,19 +3784,86 @@ class MailDumpSettingsTab extends PluginSettingTab {
     const storage = this.compactBlock(parent, 'Файл настроек');
     storage.createDiv({ cls: 'mail-dump-note', text: `Текущий: ${this.plugin.getSettingsFilePath()}` });
     storage.createDiv({ cls: 'mail-dump-note', text: this.plugin.usesExternalSettingsFile() ? 'Стандартный data.json хранит только путь к этому файлу.' : 'Используется стандартный data.json в папке плагина.' });
+    if (this.plugin.settingsLoadError) storage.createDiv({ cls: 'mail-dump-settings-error', text: this.plugin.settingsLoadError });
     let nextPath = this.plugin.getSettingsFilePath();
     addField(storage, 'Путь к JSON-файлу', nextPath, v => { nextPath = v; });
     const storageActions = storage.createDiv({ cls: 'mail-dump-account-actions' });
     addCommandButton(storageActions, 'save', 'Применить путь', async () => {
-      await this.plugin.setExternalSettingsFilePath(nextPath);
-      new Notice('MailDump: путь к файлу настроек сохранён');
-      this.display();
+      try {
+        await this.plugin.setExternalSettingsFilePath(nextPath);
+        new Notice('MailDump: путь к файлу настроек сохранён');
+        this.display();
+      } catch (error) { new Notice(`MailDump: путь не применён: ${compactError(error)}`, 12000); }
     }, 'mod-cta');
     addCommandButton(storageActions, 'rotate-ccw', 'Стандартный data.json', async () => {
-      await this.plugin.resetSettingsFilePath();
-      new Notice('MailDump: используется стандартный data.json');
+      try {
+        await this.plugin.resetSettingsFilePath();
+        new Notice('MailDump: используется стандартный data.json');
+        this.display();
+      } catch (error) { new Notice(`MailDump: data.json не сохранён: ${compactError(error)}`, 12000); }
+    });
+  }
+  renderDraftsSettingsTab(parent) {
+    const account = getAccountById(this.plugin.settings, this.plugin.settings.activeAccountId);
+    const block = this.compactBlock(parent, 'Черновики');
+    addSelect(block, 'Ящик', this.plugin.getAccounts().map(a => [a.id, `${accountDisplayName(a)} · ${accountFolderName(a)}`]), account.id, async v => {
+      this.plugin.settings.activeAccountId = v;
+      await this.saveAndRedisplay();
+    });
+    addField(block, 'Папка черновиков в Obsidian', draftsRootFolder(this.plugin.settings), async v => {
+      this.plugin.settings.draftsRootFolder = normalizeDraftRelPath(v, 'Day/Drafts');
+      await this.plugin.saveSettings();
       this.display();
     });
+    block.createDiv({ cls: 'mail-dump-note', text: `Папка текущего ящика: ${accountDraftFolderRel(this.plugin.settings, account)}` });
+    addField(block, 'Шаблон черновика', draftTemplatePath(this.plugin.settings), async v => {
+      this.plugin.settings.draftTemplatePath = normalizeDraftRelPath(v, 'Шаблоны/MailDump Draft.md');
+      await this.plugin.saveSettings();
+    });
+    addField(block, 'IMAP-папка черновиков', account.draftsMailbox || 'Drafts', async v => {
+      account.draftsMailbox = String(v || 'Drafts').trim() || 'Drafts';
+      this.plugin.settings.accounts = this.plugin.settings.accounts.map(a => a.id === account.id ? account : a);
+      await this.plugin.saveSettings();
+    });
+    addTextarea(block, 'Подпись по умолчанию', this.plugin.settings.draftDefaultSignature || '', async v => {
+      this.plugin.settings.draftDefaultSignature = v || '';
+      await this.plugin.saveSettings();
+    });
+    addCheck(block, 'После загрузки переносить .md в _uploaded', this.plugin.settings.draftMoveUploaded !== false, async v => {
+      this.plugin.settings.draftMoveUploaded = !!v;
+      await this.plugin.saveSettings();
+    });
+
+    const actions = block.createDiv({ cls: 'mail-dump-account-actions' });
+    addCommandButton(actions, 'file-input', 'Превратить текущий файл в черновик', async () => {
+      try {
+        const result = await this.plugin.createDraftFromActiveFile();
+        new Notice(`MailDump: черновик создан: ${result.rel}`);
+        this.plugin.appendMessageHistory(`Черновик создан из текущего файла: ${result.rel}`);
+      } catch (error) {
+        new Notice(`MailDump: ${error.message || error}`);
+      }
+    }, 'mod-cta');
+    addCommandButton(actions, 'file-plus', 'Создать шаблон', async () => {
+      const templateAbs = this.plugin.draftUploadService.templateAbs();
+      const overwrite = fileExists(templateAbs) ? confirm('MailDump: шаблон уже существует. Перезаписать его текущей подписью?') : false;
+      const result = this.plugin.draftUploadService.ensureAllFoldersAndTemplate(overwrite);
+      new Notice(result.template.created ? `MailDump: шаблон создан: ${result.template.rel}` : `MailDump: папки созданы, шаблон уже есть: ${result.template.rel}`);
+      this.display();
+    }, 'mod-cta');
+    addCommandButton(actions, 'folder-check', 'Проверить папку', () => {
+      const result = this.plugin.draftUploadService.inspectAccountFolder(account);
+      new Notice(`MailDump: ${result.folder.rel}; .md: ${result.files.length}`);
+      this.plugin.appendMessageHistory(`Черновики: ${result.folder.rel}; .md: ${result.files.length}`);
+    });
+    addCommandButton(actions, 'upload', 'Загрузить черновики', async () => {
+      try {
+        const result = await this.plugin.draftUploadService.uploadAccountDrafts(account);
+        new Notice(`MailDump: загружено ${result.uploaded.length}/${result.total}, ошибок: ${result.errors.length}`);
+      } catch (error) {
+        new Notice(`MailDump: ${error.message || error}`);
+      }
+    }, 'mod-cta');
   }
   renderWebmailSettingsTab(parent) {
     const block = this.compactBlock(parent, 'Ссылки на веб-почту');
@@ -2882,17 +3877,9 @@ class MailDumpSettingsTab extends PluginSettingTab {
       block.createDiv({ cls: 'mail-dump-note', text: 'Переменные: {QUERY}, {SUBJECT}, {FROM_EMAIL}, {DATE}, {MESSAGE_ID}, {UID}, {MAILBOX}, {THREAD_KEY}.' });
     }
   }
-  renderCommandSettingsTab(parent) {
-    const block = this.compactBlock(parent, 'Команды Obsidian');
-    const presetsForCommand = this.plugin.presetStore.load();
-    addSelect(block, 'Run MailDump command preset', presetsForCommand.length ? presetsForCommand.map(p => [p.id, `${p.emoji || '[preset]'} ${p.name || p.id}`]) : [['', 'No preset']], this.plugin.settings.chatCommandPresetId || presetsForCommand[0]?.id || '', async v => {
-      this.plugin.settings.chatCommandPresetId = v || '';
-      await this.plugin.saveSettings();
-    });
-  }
 }
 
-module.exports = class MailDumpM1Plugin extends Plugin {
+class MailDumpM1Plugin extends Plugin {
   async onload() {
     await this.loadSettings();
     this.availableMailboxes = [];
@@ -2907,13 +3894,27 @@ module.exports = class MailDumpM1Plugin extends Plugin {
     this.renderStatusBar(null);
     this.presetStore = new PresetStore(this);
     this.exportService = new ExportService(this);
+    this.draftUploadService = new DraftUploadService(this);
+    this.draftBootstrapResult = null;
+    this.draftBootstrapError = '';
+    try {
+      this.draftBootstrapResult = this.draftUploadService.ensureAllFoldersAndTemplate(false);
+      this.appendMessageHistory(`Черновики готовы: ${this.draftBootstrapResult.template.rel}`);
+    } catch (error) {
+      this.draftBootstrapError = error?.message || String(error);
+      console.error('[MailDump] draft bootstrap failed', error);
+      this.appendMessageHistory(`Черновики не инициализированы: ${this.draftBootstrapError}`);
+      try { new Notice(`MailDump: не удалось создать папки или шаблон черновиков: ${this.draftBootstrapError}`, 12000); } catch {}
+    }
     this.registerView(VIEW_TYPE, leaf => new MailDumpView(leaf, this));
     this.addSettingTab(new MailDumpSettingsTab(this.app, this));
     this.addCommand({ id: 'open-maildump-panel', name: 'Open MailDump panel', callback: () => this.openPanel() });
     this.addCommand({ id: 'stop-maildump-operation', name: 'Stop current MailDump operation', callback: () => this.ops.cancel() });
+    this.addCommand({ id: 'maildump-create-draft-from-active-file', name: 'MailDump: create draft from active file', callback: () => this.createDraftFromActiveFile() });
+    this.registerDraftFileMenu();
     this.addRibbonIcon('mail', 'MailDump', () => this.openPanel());
   }
-  onunload() { this.ops.cancel(); this.app.workspace.detachLeavesOfType(VIEW_TYPE); }
+  onunload() { try { this.ops?.cancel(); } catch {} try { this.app.workspace.detachLeavesOfType(VIEW_TYPE); } catch {} }
   appendMessageHistory(text, op) {
     const msg = String(text || '').trim();
     if (!msg) return;
@@ -2935,10 +3936,10 @@ module.exports = class MailDumpM1Plugin extends Plugin {
     return normalizeAbsPath(this.getVaultBasePath(), filePath);
   }
   usesExternalSettingsFile() {
-    return !!this.settingsFilePath;
+    return !!(this.settingsFilePath || this.brokenSettingsFilePath);
   }
   getSettingsFilePath() {
-    return this.settingsFilePath || this.getDefaultSettingsFilePath();
+    return this.settingsFilePath || this.brokenSettingsFilePath || this.getDefaultSettingsFilePath();
   }
   getPersistableDataCache() {
     const data = { ...(this.dataCache || {}) };
@@ -2949,52 +3950,99 @@ module.exports = class MailDumpM1Plugin extends Plugin {
   async setExternalSettingsFilePath(filePath) {
     const normalized = this.normalizeSettingsFilePath(filePath);
     const defaultPath = path.normalize(this.getDefaultSettingsFilePath());
-    this.settingsFilePath = normalized && normalized !== defaultPath ? normalized : '';
-    await this.persistData();
+    if (!normalized || normalized === defaultPath) return this.resetSettingsFilePath();
+    const previousPath = this.settingsFilePath;
+    const previousBrokenPath = this.brokenSettingsFilePath;
+    try {
+      writeJsonFileAtomic(normalized, this.getPersistableDataCache());
+      await this.saveData({ [SETTINGS_FILE_BOOTSTRAP_KEY]: normalized });
+      this.settingsFilePath = normalized;
+      this.brokenSettingsFilePath = '';
+      this.settingsLoadError = '';
+      return true;
+    } catch (error) {
+      this.settingsFilePath = previousPath;
+      this.brokenSettingsFilePath = previousBrokenPath;
+      throw error;
+    }
   }
   async resetSettingsFilePath() {
+    const payload = this.getPersistableDataCache();
+    await this.saveData(payload);
     this.settingsFilePath = '';
-    await this.persistData();
+    this.brokenSettingsFilePath = '';
+    this.settingsLoadError = '';
+    return true;
   }
   async loadSettings() {
-    const bootstrap = await this.loadData();
-    this.bootstrapData = bootstrap && typeof bootstrap === 'object' ? bootstrap : {};
+    this.settingsLoadError = '';
+    this.brokenSettingsFilePath = '';
+    let bootstrap = {};
+    try {
+      const loaded = await this.loadData();
+      bootstrap = loaded && typeof loaded === 'object' && !Array.isArray(loaded) ? loaded : {};
+    } catch (error) {
+      this.settingsLoadError = `data.json недоступен: ${compactError(error)}`;
+      console.error('[MailDump] loadData failed; using defaults', error);
+    }
+    this.bootstrapData = bootstrap;
     this.settingsFilePath = this.normalizeSettingsFilePath(this.bootstrapData[SETTINGS_FILE_BOOTSTRAP_KEY] || '');
     let raw = this.bootstrapData;
     if (this.settingsFilePath) {
-      const external = readJsonFile(this.settingsFilePath, null);
-      if (external && typeof external === 'object') raw = external;
+      try {
+        const external = readJsonFileStrict(this.settingsFilePath);
+        if (!external || typeof external !== 'object' || Array.isArray(external)) {
+          const error = new Error('External settings root must be a JSON object');
+          error.code = 'INVALID_SETTINGS_ROOT';
+          throw error;
+        }
+        raw = external;
+      } catch (error) {
+        this.brokenSettingsFilePath = this.settingsFilePath;
+        this.settingsFilePath = '';
+        raw = {};
+        this.settingsLoadError = `Внешний файл настроек отключён: ${compactError(error)}`;
+        console.error('[MailDump] external settings disabled; using defaults', error);
+      }
     }
-    this.dataCache = raw && typeof raw === 'object' ? raw : {};
+    this.dataCache = raw && typeof raw === 'object' && !Array.isArray(raw) ? { ...raw } : {};
     delete this.dataCache[SETTINGS_FILE_BOOTSTRAP_KEY];
     const sourceSettings = this.dataCache.settings && typeof this.dataCache.settings === 'object' ? this.dataCache.settings : this.dataCache;
     this.settings = Object.assign({}, DEFAULT_SETTINGS, sourceSettings || {});
-    if (this.settings.password && !this.settings.appPassword) {
-      this.settings.appPassword = this.settings.password;
-      delete this.settings.password;
-    }
+    if (this.settings.password && !this.settings.appPassword) this.settings.appPassword = this.settings.password;
     delete this.settings.password;
+    const vaultBasePath = this.getVaultBasePath();
+    this.settings.draftsRootFolder = normalizeVaultRelativePath(vaultBasePath, this.settings.draftsRootFolder, 'Day/Drafts');
+    this.settings.draftTemplatePath = normalizeVaultRelativePath(vaultBasePath, this.settings.draftTemplatePath, 'Шаблоны/MailDump Draft.md');
     migrateAccounts(this.settings);
     this.dataCache.settings = this.settings;
-    if (!Array.isArray(this.dataCache.presets)) this.dataCache.presets = Array.isArray(this.dataCache.presets) ? this.dataCache.presets : undefined;
-    await this.persistData();
+    if (!Array.isArray(this.dataCache.presets)) delete this.dataCache.presets;
   }
   async saveSettings() {
     this.dataCache = this.dataCache || {};
     this.dataCache.settings = this.settings;
-    await this.persistData();
+    try {
+      await this.persistData();
+      this.lastPersistenceError = '';
+      return true;
+    } catch (error) {
+      this.lastPersistenceError = compactError(error);
+      console.error('[MailDump] settings persistence failed', error);
+      try { new Notice(`MailDump: настройки не сохранены: ${this.lastPersistenceError}`, 12000); } catch {}
+      return false;
+    }
   }
   async persistData() {
     this.dataCache = this.dataCache || {};
     if (!this.dataCache.settings) this.dataCache.settings = this.settings || DEFAULT_SETTINGS;
-    if (this.settingsFilePath) {
-      const payload = this.getPersistableDataCache();
-      writeJsonFile(this.settingsFilePath, payload);
-      await this.saveData({ [SETTINGS_FILE_BOOTSTRAP_KEY]: this.settingsFilePath });
-      return;
-    }
     const payload = this.getPersistableDataCache();
+    if (this.settingsFilePath) {
+      writeJsonFileAtomic(this.settingsFilePath, payload);
+      await this.saveData({ [SETTINGS_FILE_BOOTSTRAP_KEY]: this.settingsFilePath });
+      return true;
+    }
     await this.saveData(payload);
+    return true;
   }
   getAccounts() { return migrateAccounts(this.settings); }
   getPresetAccount(preset) { return getPresetAccount(this.settings, preset); }
@@ -3029,12 +4077,76 @@ module.exports = class MailDumpM1Plugin extends Plugin {
     const progress = op.progressMode === 'percent' ? ` ${Math.max(0, Math.min(100, Number(op.progress || 0)))}%` : '';
     this.statusBarEl.setText(`MailDump: ${prefix}${progress}`);
   }
+  async createDraftFromActiveFile() {
+    const file = this.app.workspace.getActiveFile?.();
+    if (!file || !file.path) throw new Error('Нет активного файла для черновика');
+    const result = await this.draftUploadService.createDraftFromSourceFile(file);
+    new Notice(`MailDump: черновик создан: ${result.rel}`);
+    this.appendMessageHistory(`Черновик создан из файла: ${result.rel}`);
+    return result;
+  }
+  registerDraftFileMenu() {
+    if (!this.app.workspace?.on || typeof this.registerEvent !== 'function') return;
+    this.registerEvent(this.app.workspace.on('file-menu', (menu, file) => {
+      if (!file || !file.path || file.children || !menu?.addItem) return;
+      menu.addItem(item => {
+        item.setSection?.('file');
+        item
+          .setTitle('MailDump: превратить в черновик')
+          .setIcon('mail-plus')
+          .onClick(async () => {
+            try {
+              const result = await this.draftUploadService.createDraftFromSourceFile(file);
+              new Notice(`MailDump: черновик создан: ${result.rel}`);
+              this.appendMessageHistory(`Черновик создан из файла: ${result.rel}`);
+            } catch (error) {
+              new Notice(`MailDump: ${error.message || error}`);
+            }
+          });
+      });
+    }));
+  }
   abortActiveClient() { try { if (this.activeClient) this.activeClient.abort(); } catch {} }
   async openPanel() {
-    let leaf = this.app.workspace.getLeavesOfType(VIEW_TYPE)[0];
-    if (!leaf) { leaf = this.app.workspace.getRightLeaf(false); await leaf.setViewState({ type: VIEW_TYPE, active: true }); }
-    this.app.workspace.revealLeaf(leaf);
+    const workspace = this.app.workspace;
+    let leaf = workspace.getLeavesOfType?.(VIEW_TYPE)?.[0] || null;
+    if (!leaf) leaf = workspace.getRightLeaf?.(false) || workspace.getRightLeaf?.(true) || workspace.getLeaf?.('tab') || null;
+    if (!leaf || typeof leaf.setViewState !== 'function') {
+      const error = new Error('Obsidian did not provide a workspace leaf for MailDump');
+      error.code = 'WORKSPACE_LEAF_UNAVAILABLE';
+      throw error;
+    }
+    await leaf.setViewState({ type: VIEW_TYPE, active: true });
+    if (typeof workspace.revealLeaf === 'function') workspace.revealLeaf(leaf);
+    return leaf;
   }
+}
+
+MailDumpM1Plugin.headless = {
+  MailDumpHeadlessError,
+  loadState: loadHeadlessState,
+  selectPreset: selectHeadlessPreset,
+  validateSelection: validateHeadlessSelection,
+  acquireRunLock,
+  releaseRunLock,
+  run: runHeadless,
+  formatError: formatHeadlessError
 };
+
+MailDumpM1Plugin.drafts = {
+  createDraftTemplate,
+  parseDraftMarkdown,
+  createDraftMarkdownFromSourceFile,
+  buildDraftMimeMessage,
+  resolveDraftAttachmentRefs,
+  extractDraftAttachmentRefs,
+  DraftUploadService,
+  normalizeVaultRelativePath,
+  draftsRootFolder,
+  draftTemplatePath,
+  accountDraftFolderRel
+};
+
+module.exports = MailDumpM1Plugin;
 
 /* nosourcemap */

@@ -1,4 +1,4 @@
-/* MailDump v0.1.2 */
+/* MailDump v0.1.5 */
 
 .mail-dump-panel {
   height: 100%;
@@ -567,4 +567,42 @@
 .mail-dump-empty {
   color: var(--text-muted);
   padding: 12px 0;
+}
+
+
+.mail-dump-path-row {
+  margin: 9px 0;
+}
+
+.mail-dump-path-label {
+  margin-bottom: 4px;
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+}
+
+.mail-dump-path-controls {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 5px;
+  align-items: center;
+}
+
+.mail-dump-path-controls input {
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+}
+
+.mail-dump-path-controls .mail-dump-command-button {
+  white-space: nowrap;
+}
+
+@media (max-width: 420px) {
+  .mail-dump-path-controls {
+    grid-template-columns: minmax(0, 1fr) 1fr;
+  }
+
+  .mail-dump-path-controls input {
+    grid-column: 1 / -1;
+  }
 }

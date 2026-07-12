@@ -1,7 +1,7 @@
 {
   "id": "maildump",
   "name": "MailDump",
-  "version": "0.1.2",
+  "version": "0.1.9",
   "minAppVersion": "1.5.0",
   "description": "Export IMAP mail into analysis-ready Markdown digests and optional mail notes with adjacent attachments.",
   "author": "Andrey Kudlay",

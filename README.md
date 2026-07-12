@@ -1,6 +1,6 @@
 # MailDump
 
-Current release: `0.1.2`.
+Current release: `0.1.9`.
 
 > IMAP mail → clean Markdown digest → structured analysis inside Obsidian.
 
@@ -11,6 +11,12 @@ It is built for people who do not need another pretty mailbox. They need a contr
 No CSV graveyard. No fake AI magic. No black-box sync. Just mail pulled into a vault in a form that can be inspected, reused, archived and analyzed.
 
 ---
+
+## Release 0.1.9
+
+- Moved the main panel Drafts actions into the last tab, after Journal.
+- Marked the file explorer draft action for Obsidian's file menu section.
+- Published updated release assets for the Obsidian community updater.
 
 ## Release 0.1.2
 
