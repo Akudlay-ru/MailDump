@@ -1,6 +1,6 @@
 # MailDump
 
-Current release: `0.1.9`.
+Current release: `0.1.10`.
 
 > IMAP mail → clean Markdown digest → structured analysis inside Obsidian.
 
@@ -11,6 +11,12 @@ It is built for people who do not need another pretty mailbox. They need a contr
 No CSV graveyard. No fake AI magic. No black-box sync. Just mail pulled into a vault in a form that can be inspected, reused, archived and analyzed.
 
 ---
+
+## Release 0.1.10
+
+- Added schedule controls inside each preset with daily, workday, selected weekday and interval modes.
+- MailDump checks for missed scheduled exports after Obsidian starts and asks before running them.
+- Created draft files stay in the background instead of switching the active pane to the draft.
 
 ## Release 0.1.9
 

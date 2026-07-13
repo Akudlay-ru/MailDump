@@ -1,5 +1,5 @@
 /* ============================================================================
- * MailDump v0.1.9
+ * MailDump v0.1.10
  * First public compliance build.
  *
  * Desktop-only Obsidian plugin for exporting IMAP mail into analysis-ready
@@ -59,6 +59,16 @@ const SORT_OPTIONS = [
   ['from', 'Отправитель'],
   ['folder', 'Папка']
 ];
+
+const SCHEDULE_MODE_OPTIONS = [
+  ['disabled', 'Выключено'],
+  ['daily', 'Раз в день'],
+  ['workdays', 'Рабочие дни'],
+  ['weekdays', 'Дни недели'],
+  ['interval', 'Интервал']
+];
+
+const WEEKDAY_OPTIONS = [[1, 'Пн'], [2, 'Вт'], [3, 'Ср'], [4, 'Чт'], [5, 'Пт'], [6, 'Сб'], [0, 'Вс']];
 
 const DEFAULT_PRESETS = [
   ['preset_mail_yesterday', '📧', 'Почта за вчера', 'yesterday', ['INBOX', 'Sent'], 'Выгрузки писем'],
@@ -938,6 +948,64 @@ function buildDateCriteria(fromDate, toDate) {
   toExclusive.setDate(toExclusive.getDate() + 1);
   return `SINCE ${fmt(fromDate)} BEFORE ${fmt(toExclusive)}`;
 }
+function normalizeTimeOfDay(value, fallback = '09:00') {
+  const m = String(value || '').trim().match(/^(\d{1,2}):(\d{2})$/);
+  if (!m) return fallback;
+  const h = Math.max(0, Math.min(23, Number(m[1])));
+  const min = Math.max(0, Math.min(59, Number(m[2])));
+  return `${String(h).padStart(2, '0')}:${String(min).padStart(2, '0')}`;
+}
+function normalizeWeekdays(value, fallback = [1, 2, 3, 4, 5]) {
+  const raw = Array.isArray(value) ? value : fallback;
+  const set = new Set(raw.map(Number).filter(n => n >= 0 && n <= 6));
+  return set.size ? Array.from(set).sort((a, b) => a - b) : fallback.slice();
+}
+function defaultPresetSchedule() {
+  return { enabled: false, mode: 'daily', time: '09:00', weekdays: [1, 2, 3, 4, 5], intervalMinutes: 1440, lastRunAt: '', lastCheckedAt: '' };
+}
+function normalizePresetSchedule(raw) {
+  const source = raw && typeof raw === 'object' ? raw : {};
+  const mode = ['daily', 'workdays', 'weekdays', 'interval'].includes(source.mode) ? source.mode : 'daily';
+  return {
+    enabled: !!source.enabled,
+    mode,
+    time: normalizeTimeOfDay(source.time, '09:00'),
+    weekdays: normalizeWeekdays(source.weekdays, [1, 2, 3, 4, 5]),
+    intervalMinutes: Math.max(5, Math.min(10080, Number(source.intervalMinutes || 1440))),
+    lastRunAt: source.lastRunAt ? String(source.lastRunAt) : '',
+    lastCheckedAt: source.lastCheckedAt ? String(source.lastCheckedAt) : ''
+  };
+}
+function scheduleDateAt(date, timeText) {
+  const [h, m] = normalizeTimeOfDay(timeText).split(':').map(Number);
+  const d = new Date(date);
+  d.setHours(h, m, 0, 0);
+  return d;
+}
+function scheduleDayMatches(schedule, date) {
+  const day = date.getDay();
+  if (schedule.mode === 'daily') return true;
+  if (schedule.mode === 'workdays') return day >= 1 && day <= 5;
+  if (schedule.mode === 'weekdays') return normalizeWeekdays(schedule.weekdays).includes(day);
+  return false;
+}
+function latestScheduledAt(scheduleInput, now = new Date()) {
+  const schedule = normalizePresetSchedule(scheduleInput);
+  if (!schedule.enabled) return null;
+  if (schedule.mode === 'interval') {
+    const anchor = schedule.lastRunAt ? new Date(schedule.lastRunAt) : (schedule.lastCheckedAt ? new Date(schedule.lastCheckedAt) : null);
+    if (!anchor || Number.isNaN(anchor.getTime())) return null;
+    const due = new Date(anchor.getTime() + schedule.intervalMinutes * 60000);
+    return due <= now ? due : null;
+  }
+  for (let offset = 0; offset < 14; offset++) {
+    const day = new Date(now);
+    day.setDate(now.getDate() - offset);
+    const due = scheduleDateAt(day, schedule.time);
+    if (due <= now && scheduleDayMatches(schedule, due)) return due;
+  }
+  return null;
+}
 function createPreset(id, emoji, name, mode, mailboxes, subfolder) {
   const isPostmits = /postmit|постмит/i.test(String(id || '') + ' ' + String(name || '') + ' ' + (Array.isArray(mailboxes) ? mailboxes.join(' ') : ''));
   return {
@@ -976,6 +1044,7 @@ function createPreset(id, emoji, name, mode, mailboxes, subfolder) {
       customAttachmentExtensions: ''
     },
     performance: { fetchBatchSize: 10 },
+    schedule: defaultPresetSchedule(),
     sort: { by: 'date', direction: 'asc' }
   };
 }
@@ -1036,6 +1105,7 @@ function migratePreset(raw, accountId = DEFAULT_ACCOUNT_ID) {
     customAttachmentExtensions: raw.artifacts?.customAttachmentExtensions || ''
   };
   p.performance = { fetchBatchSize: Number(raw.performance?.fetchBatchSize || raw.fetchBatchSize || p.performance.fetchBatchSize || 10) };
+  p.schedule = normalizePresetSchedule(raw.schedule || p.schedule);
   p.sort = { by: raw.sort?.by || 'date', direction: raw.sort?.direction === 'desc' ? 'desc' : 'asc' };
   return p;
 }
@@ -1422,6 +1492,66 @@ class PresetStore {
     if (!imported.length) throw new Error('В файле нет пресетов');
     this.save(imported);
     return imported;
+  }
+}
+
+class ScheduleService {
+  constructor(plugin) { this.plugin = plugin; this.timer = null; }
+  loadPresets() { return this.plugin.presetStore?.load ? this.plugin.presetStore.load() : []; }
+  savePresets(presets) { if (this.plugin.presetStore?.save) this.plugin.presetStore.save(presets); }
+  start() {
+    this.checkMissedSchedules();
+    if (typeof this.plugin.registerInterval === 'function') {
+      this.timer = globalThis.setInterval(() => this.runDueSchedules(false), 60000);
+      this.plugin.registerInterval(this.timer);
+    }
+  }
+  async checkMissedSchedules() { return this.runDueSchedules(true); }
+  async runDueSchedules(askMissed = false, now = new Date()) {
+    const presets = this.loadPresets();
+    let changed = false;
+    for (const preset of presets) {
+      const schedule = normalizePresetSchedule(preset.schedule);
+      preset.schedule = schedule;
+      if (!schedule.enabled) continue;
+      const dueAt = latestScheduledAt(schedule, now);
+      if (!dueAt) {
+        if (!schedule.lastCheckedAt) { schedule.lastCheckedAt = now.toISOString(); changed = true; }
+        continue;
+      }
+      const lastRunAt = schedule.lastRunAt ? new Date(schedule.lastRunAt) : null;
+      if (lastRunAt && !Number.isNaN(lastRunAt.getTime()) && lastRunAt >= dueAt) {
+        schedule.lastCheckedAt = now.toISOString();
+        changed = true;
+        continue;
+      }
+      const lastCheckedAt = schedule.lastCheckedAt ? new Date(schedule.lastCheckedAt) : null;
+      const missed = askMissed && lastCheckedAt && !Number.isNaN(lastCheckedAt.getTime()) && dueAt > lastCheckedAt && dueAt <= now;
+      if (missed) {
+        const ok = typeof confirm === 'function' ? confirm(`MailDump: пропущена выгрузка «${preset.name}» за ${formatDateTime(dueAt)}. Выполнить сейчас?`) : false;
+        if (!ok) {
+          schedule.lastRunAt = dueAt.toISOString();
+          schedule.lastCheckedAt = now.toISOString();
+          changed = true;
+          continue;
+        }
+      } else if (askMissed) {
+        schedule.lastCheckedAt = now.toISOString();
+        changed = true;
+        continue;
+      }
+      try {
+        await this.plugin.exportService.runPreset(preset);
+        schedule.lastRunAt = now.toISOString();
+        this.plugin.appendMessageHistory(`Расписание: выполнен пресет «${preset.name}»`);
+      } catch (error) {
+        this.plugin.appendMessageHistory(`Расписание: ошибка пресета «${preset.name}»: ${error.message || error}`);
+      }
+      schedule.lastCheckedAt = now.toISOString();
+      changed = true;
+    }
+    if (changed) this.savePresets(presets);
+    return { checked: presets.length, changed };
   }
 }
 
@@ -3213,6 +3343,7 @@ class MailDumpView extends ItemView {
     if (this.activeTab === 'filters') return this.renderFiltersTab(parent);
     if (this.activeTab === 'output') return this.renderOutputTab(parent);
     if (this.activeTab === 'drafts') return this.renderDraftsTab(parent);
+    if (this.activeTab === 'schedule') this.activeTab = 'journal';
     if (this.activeTab === 'journal') return this.renderJournalTab(parent);
     return this.renderPresetTab(parent);
   }
@@ -3243,6 +3374,7 @@ class MailDumpView extends ItemView {
     }
     addSelect(main, 'Сортировка', SORT_OPTIONS, p.sort.by, v => { p.sort.by = v; this.savePresets(); });
     addSelect(main, 'Порядок', [['asc', 'По возрастанию'], ['desc', 'По убыванию']], p.sort.direction, v => { p.sort.direction = v; this.savePresets(); });
+    this.renderPresetScheduleBlock(parent, p);
 
     const content = this.compactBlock(parent, 'Содержимое');
     const checks = content.createDiv({ cls: 'mail-dump-check-grid' });
@@ -3277,6 +3409,53 @@ class MailDumpView extends ItemView {
       p.performance = p.performance || {};
       p.performance.fetchBatchSize = Number(v || 10);
       this.savePresets();
+    });
+  }
+  renderPresetScheduleBlock(parent, p) {
+    p.schedule = normalizePresetSchedule(p.schedule);
+    const schedule = p.schedule;
+    const plan = this.compactBlock(parent, 'Расписание');
+    addCheck(plan, 'Включить расписание для этого пресета', schedule.enabled, v => {
+      schedule.enabled = !!v;
+      schedule.lastCheckedAt = new Date().toISOString();
+      this.savePresets();
+      this.render();
+    });
+    addSelect(plan, 'Режим', SCHEDULE_MODE_OPTIONS, schedule.enabled ? schedule.mode : 'disabled', v => {
+      schedule.enabled = v !== 'disabled';
+      if (v !== 'disabled') schedule.mode = v;
+      schedule.lastCheckedAt = new Date().toISOString();
+      this.savePresets();
+      this.render();
+    });
+    if (schedule.mode !== 'interval') {
+      addField(plan, 'Время запуска', schedule.time, v => {
+        schedule.time = normalizeTimeOfDay(v, schedule.time);
+        this.savePresets();
+      }, 'time');
+    }
+    if (schedule.mode === 'weekdays') {
+      const days = plan.createDiv({ cls: 'mail-dump-check-grid' });
+      const selected = new Set(normalizeWeekdays(schedule.weekdays));
+      for (const [day, label] of WEEKDAY_OPTIONS) addCheck(days, label, selected.has(day), v => {
+        v ? selected.add(day) : selected.delete(day);
+        schedule.weekdays = normalizeWeekdays(Array.from(selected), [1, 2, 3, 4, 5]);
+        this.savePresets();
+      });
+    }
+    if (schedule.mode === 'interval') {
+      addField(plan, 'Интервал, минут', schedule.intervalMinutes, v => {
+        schedule.intervalMinutes = Math.max(5, Math.min(10080, Number(v || 1440)));
+        schedule.lastCheckedAt = new Date().toISOString();
+        this.savePresets();
+      }, 'number');
+    }
+    const dueAt = latestScheduledAt(schedule, new Date());
+    plan.createDiv({ cls: 'mail-dump-note', text: dueAt ? `Ближайшее/пропущенное событие: ${formatDateTime(dueAt)}` : 'Пропущенные события проверяются при запуске Obsidian. Если выгрузка была пропущена, MailDump спросит, выполнить ли её сейчас.' });
+    const scheduleActions = plan.createDiv({ cls: 'mail-dump-actions' });
+    addCommandButton(scheduleActions, 'calendar-check', 'Проверить пропущенные', async () => {
+      await this.plugin.scheduleService?.checkMissedSchedules();
+      this.renderStatus();
     });
   }
   renderMailboxesTab(parent) {
@@ -3906,6 +4085,8 @@ class MailDumpM1Plugin extends Plugin {
       this.appendMessageHistory(`Черновики не инициализированы: ${this.draftBootstrapError}`);
       try { new Notice(`MailDump: не удалось создать папки или шаблон черновиков: ${this.draftBootstrapError}`, 12000); } catch {}
     }
+    this.scheduleService = new ScheduleService(this);
+    this.scheduleService.start();
     this.registerView(VIEW_TYPE, leaf => new MailDumpView(leaf, this));
     this.addSettingTab(new MailDumpSettingsTab(this.app, this));
     this.addCommand({ id: 'open-maildump-panel', name: 'Open MailDump panel', callback: () => this.openPanel() });
@@ -4145,6 +4326,12 @@ MailDumpM1Plugin.drafts = {
   draftsRootFolder,
   draftTemplatePath,
   accountDraftFolderRel
+};
+
+MailDumpM1Plugin.schedules = {
+  ScheduleService,
+  normalizePresetSchedule,
+  latestScheduledAt
 };
 
 module.exports = MailDumpM1Plugin;
